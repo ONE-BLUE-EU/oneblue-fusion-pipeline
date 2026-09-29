@@ -27,7 +27,7 @@ import requests
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-from query_external_data import load_campaigns_from_samples  # noqa: E402
+from query_external_data import load_campaigns_from_samples, campaign_date_window, temporal_scope  # noqa: E402
 
 OUT = ROOT / "dkan_resources" / "climate.csv"
 
@@ -48,6 +48,7 @@ COMMON_COLS = [
     "campaign_lat_min", "campaign_lat_max",
     "campaign_lon_min", "campaign_lon_max",
     "campaign_date_min", "campaign_date_max",
+    "query_date_min", "query_date_max", "temporal_scope",
     "source", "data_type", "dataset_id", "feature_id",
     "time", "lat", "lon", "depth_m",
     "geom_wkt",
@@ -89,11 +90,12 @@ def fetch_one(camp: dict) -> list[dict]:
         return []
     lat = camp["clat"]
     lon = camp["clon"]
+    query_start, query_end = campaign_date_window(camp)
     params = {
         "latitude":  f"{lat:.4f}",
         "longitude": f"{lon:.4f}",
-        "start_date": camp["date_min"],
-        "end_date":   camp["date_max"],
+        "start_date": query_start,
+        "end_date":   query_end,
         "hourly":     ",".join(HOURLY_VARS),
         "timezone":   "UTC",
     }
@@ -121,6 +123,9 @@ def fetch_one(camp: dict) -> list[dict]:
             "campaign_lon_max":  camp["lon_max"],
             "campaign_date_min": camp["date_min"],
             "campaign_date_max": camp["date_max"],
+            "query_date_min": query_start,
+            "query_date_max": query_end,
+            "temporal_scope": temporal_scope(camp, day.isoformat()),
             "source":            "Open-Meteo (ERA5 archive)",
             "data_type":         "climate_daily",
             "dataset_id":        "open-meteo-era5",
@@ -143,8 +148,7 @@ def fetch_one(camp: dict) -> list[dict]:
             "surface_pressure_mean_hpa":     g["surface_pressure"].mean(),
             "cloud_cover_mean_pct":          g["cloud_cover"].mean(),
             "extra_json":                    json.dumps({"hourly_records": int(len(g))}),
-            "source_url":                    f"{API_URL}?latitude={lat:.4f}&longitude={lon:.4f}"
-                                             f"&start_date={camp['date_min']}&end_date={camp['date_max']}",
+            "source_url":                    r.url,
         })
     return rows
 

@@ -1,6 +1,6 @@
 # ONE-BLUE Fusion Pipeline
 
-Standalone pipeline that builds the geo-indexed external-data resources as part of the ONE-BLUE data fusion activities. For every ONE-BLUE sampling campaign it fetches matching slices of public marine datasets and writes one CSV per data category into `output/`.
+Standalone pipeline that builds the geo-indexed external-data resources as part of the ONE-BLUE data fusion activities. For every ONE-BLUE sampling campaign it fetches matching slices of public marine datasets, writes source CSVs into `dkan_resources/`, and publishes analytical Parquet plus static map bundles into `output/fused/`.
 
 All output CSVs share a common geo-ready header so they can be filtered by campaign and rendered on a map widget directly from the CECsMarineGUI.
 
@@ -17,11 +17,13 @@ fetch_gbif_occurrences.py     Step 3 — GBIF species occurrences per campaign b
 fetch_msfd.py                 Step 3 — MSFD marine regions overlay
 fetch_raster_manifest.py      Step 3 — curated raster/WMS layer catalogue
 enrich_outputs.py             Step 4 — add perturbation_class and suspect-list matches
+build_fused_outputs.py        Step 5 — publish Parquet, candidate matches, catalog and static GeoJSON
 query_external_data.py        Shared utilities (campaign loader, coord parsers, ERDDAP helpers)
 
 SAMPLES/                      Input: one .xlsx per campaign (ONE-BLUE Data Collection Template)
 ONE-BLUE suspect list_v1.1.xlsx  Reference: NORMAN-database suspect chemical list
-output/               Output: one CSV per data category
+dkan_resources/               Intermediate: one CSV per data category
+output/fused/                 Published Parquet and campaign-scoped map bundles
 ```
 
 ---
@@ -37,13 +39,43 @@ Place all filled-in Data Collection Template `.xlsx` files inside a `SAMPLES/` f
 
 All steps are run from the project root with a Python 3.10+ environment.
 
+**Implementation status (2026-09-29):** The pipeline has been run against all nine workbooks. Inclusive calendar-day durations, retained suspect values, padded temporal queries, OBIS spatial tiling, and Parquet/GeoJSON publication are implemented. The verified publication contains 7,334 sample rows and 6,436 candidate matches. Some upstream categories remain explicitly partial or unavailable; inspect `output/fused/catalog.json` before use. [The ingestion findings](docs/sample-review.md) document retained source issues, and [the output guide](docs/output-and-leaflet.md) defines the visualization contract.
+
 **Step 1 — build the campaign index**
 
 ```bash
 python build_samples_csv.py
 ```
 
-Reads every `.xlsx` in `SAMPLES/`, normalises coordinates and dates, and writes `samples.csv`. All downstream scripts use this file as their starting point.
+Reads every `.xlsx` in `SAMPLES/`, normalises coordinates and dates, and writes [samples.csv](samples.csv) and [samples.audit.json](samples.audit.json). All downstream scripts use the same normalized records. The audit includes workbook checksums, source-row quality issues and coordinate/date extrema. Invalid rows are retained, not silently dropped.
+
+`latitude` and `longitude` are populated only for actual points. Coordinate ranges use `latitude_min/max` and `longitude_min/max` with `spatial_kind=extent`; they must not be rendered as measured point samples. `campaign_id` distinguishes workbooks even when their original `campaign_code` is duplicated. `sample_id` is stable for a workbook filename and Excel row; inserting/reordering rows changes affected IDs. Original identifiers, matrix, raw coordinate/time/duration values and source rows are preserved.
+
+Durations use inclusive calendar days by default: 1 day is the sampling date itself, 2 days includes the following date. The default can also be specified explicitly:
+
+```bash
+python build_samples_csv.py --duration-mode inclusive
+```
+
+`inclusive` computes start + max(days - 1, 0). The optional `--duration-mode elapsed` retains the alternative start + days calculation. Mixed numeric/clock/range hours are preserved in `duration_hours_raw`, flagged `hours_ignored_day_resolution`, and do not affect day-level bounds or block fetching. Sub-day/overnight timing is deliberately not inferred.
+
+Suspect coordinates and dates are retained literally, with audit flags. Valid but unusual values still contribute to campaign bounds. Unparseable values remain as raw data with null normalized values; no location, hemisphere or date is invented. Missing geometry does not remove a sample from the index. Copied campaign metadata stays visible, but workbook IDs keep campaigns separate. Unreadable workbooks and campaigns without usable spatial/date bounds still fail validation.
+
+A changed workbook, missing audit, or edited CSV invalidates the index. Automatic regeneration uses the inclusive default.
+
+### Day-Level Query Padding
+
+Sampling dates stay in `campaign_date_min/max`. Dated provider requests use a separate `query_date_min/max`, extending the campaign window **30 calendar days on each side**. `campaign_date_window()` centralizes this policy; `CONTEXT_DAYS` is the default and a campaign's `context_days` can override it. Zero padding requests the exact sampling dates. Timestamp-based requests include the final day through 23:59:59 UTC as a query convention, not a claim that local sample timestamps were recorded in UTC.
+
+For example, sampling on 2026-08-03 queries 2026-07-04 through 2026-09-02. Padding is applied to the original dates once, never to an already padded window. The retained Arctic 2023-2024 and Iberian August 2026 dates are not corrected or shortened automatically.
+
+The main fetcher, climate and GBIF outputs include `temporal_scope`: `within_sample_window`, `overlaps_sample_window`, `context` or `unknown`. This describes temporal support only, not spatial/depth matching or scientific equivalence. Interval records crossing the sample-window boundary remain distinguishable from observations entirely within it. Undated records and service manifests are not labelled as observed in-window data. The broader spatial-buffer and bounded-download work remains pending.
+
+Run the offline ingestion and mocked provider regression tests:
+
+```bash
+python -m unittest discover -s tests -p test_pipeline.py
+```
 
 **Step 2 — fetch external datasets**
 
@@ -77,6 +109,14 @@ python enrich_outputs.py
 ```
 
 Adds `perturbation_class` to `chemistry.csv` and `human_activities.csv`, and cross-references chemistry records against the ONE-BLUE suspect list. Must be run after Step 2.
+
+**Step 5 — publish analytical and map outputs**
+
+```bash
+python build_fused_outputs.py
+```
+
+Writes GeoParquet-compatible category files, precomputed sample-to-record candidate matches, `catalog.json`, and campaign-scoped GeoJSON/assets bundles to `output/fused/`. Map chunks are capped at approximately 2 MiB; display polygons may be simplified while complete geometry remains in Parquet. See [the output and Leaflet guide](docs/output-and-leaflet.md) for schemas, limitations, and loading examples.
 
 ---
 
@@ -145,5 +185,7 @@ Source-specific measurement columns follow, then `extra_json` and `source_url`.
 ## Dependencies
 
 ```bash
-pip install pandas requests argopy copernicusmarine openpyxl geopandas shapely
+python -m pip install -r requirements.txt
 ```
+
+`argopy` and `copernicusmarine` are optional provider clients and are not included in the core pinned environment. Install them separately in a compatible Python environment when those providers are required. The verified Windows Python 3.14 run could not install/use `argopy`, and Copernicus data downloads also require credentials.

@@ -271,58 +271,48 @@ _HEMI_RE    = __import__("re").compile(r"[NSEWOnsewо]")
 
 
 def _parse_coord(val):
-    """Parse a Latitude / Longitude cell to a decimal-degree float, or None.
+    """Return a point coordinate; ranges must use _parse_coord_extent instead."""
+    extent = _parse_coord_extent(val)
+    return extent[0] if extent and extent[0] == extent[1] else None
 
-    Accepts:
-      * numeric values (already decimal degrees, signed)
-      * decimal-degrees with hemisphere letter, e.g. '15.727E', '38.0175 N'
-      * deg-decmin with hemisphere, e.g. '43 45.83 N', '002 50,211 E'
-      * deg-min-sec with hemisphere, e.g. '7 12 44.278 W'
-      * range form 'a - b' / 'a-b' (the first endpoint is taken)
-      * ',' as decimal separator
-    """
+
+def _parse_coord_extent(val):
+    """Return both coordinate bounds, or None for invalid/incomplete cells."""
+    import re
+
     if val is None:
         return None
     if isinstance(val, (int, float)):
-        if isinstance(val, float) and math.isnan(val):
+        return (float(val), float(val)) if math.isfinite(val) else None
+    text = str(val).strip().upper().replace(",", ".")
+    text = re.sub(r"(\d)\s+\.(\d)", r"\1.\2", text)
+    endpoints = re.split(r"(?<=[0-9NSEWO])\s*[-\u2013\u2014]\s*(?=[+-]?\d|X)", text)
+    if len(endpoints) > 2:
+        return None
+    values = []
+    for endpoint in endpoints:
+        endpoint = re.sub(r"[\u00b0\u2032\u2033'\"]", " ", endpoint).strip()
+        match = re.fullmatch(
+            r"([+-]?\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?))?"
+            r"(?:\s+(\d+(?:\.\d+)?))?\s*([NSEWO])?", endpoint)
+        if not match:
             return None
-        return float(val)
-    s = str(val).strip()
-    if not s:
-        return None
-    # Range form: take the first endpoint (split on dash NOT followed by digits in deg)
-    if " - " in s or "- " in s or " -" in s:
-        s = s.split("-", 1)[0].strip()
-    elif "—" in s:
-        s = s.split("—", 1)[0].strip()
-    s = s.replace(",", ".")
-    # Merge "DD .ddd" (space before bare decimal) into "DD.ddd" — e.g. "23 .670" → "23.670"
-    s = __import__("re").sub(r"(\d)\s+\.(\d)", r"\1.\2", s)
-    hemi_match = _HEMI_RE.search(s)
-    hemi = hemi_match.group(0).upper() if hemi_match else ""
-    nums = _DMS_NUM_RE.findall(s if not hemi_match else s[: hemi_match.start()])
-    if not nums:
-        return None
-    try:
-        nums = [float(n) for n in nums[:3]]
-    except ValueError:
-        return None
-    deg = nums[0]
-    sign = -1 if deg < 0 else 1
-    deg = abs(deg)
-    if len(nums) >= 2:
-        deg += nums[1] / 60.0
-    if len(nums) >= 3:
-        deg += nums[2] / 3600.0
-    if hemi in ("S", "W", "O"):  # O = Oeste/Ouest (Portuguese/French for West)
-        sign = -1
-    elif hemi in ("N", "E"):
-        sign = 1 if sign > 0 else -1
-    return sign * deg
+        degrees, minutes, seconds, hemisphere = match.groups()
+        if minutes is not None and hemisphere is None and not degrees.startswith(("+", "-")):
+            return None
+        degrees = float(degrees)
+        minutes, seconds = float(minutes or 0), float(seconds or 0)
+        if minutes >= 60 or seconds >= 60:
+            return None
+        if degrees < 0 and hemisphere in ("N", "E"):
+            return None
+        sign = -1 if degrees < 0 or hemisphere in ("S", "W", "O") else 1
+        values.append(sign * (abs(degrees) + minutes / 60 + seconds / 3600))
+    return min(values), max(values)
 
 
 def _date_str(d):
-    """Normalise a date value to YYYY-MM-DD string or None."""
+    """Normalize native Excel dates or ISO strings, rejecting ambiguous text."""
     if d is None or (isinstance(d, float) and math.isnan(d)):
         return None
     try:
@@ -338,9 +328,11 @@ def _date_str(d):
     s = str(d).strip()
     if not s:
         return None
-    # try pandas parser as a last resort
+    import re
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].+)?", s):
+        return None
     try:
-        ts = pd.to_datetime(s, errors="coerce", dayfirst=False)
+        ts = pd.to_datetime(s, errors="coerce")
         if pd.notna(ts):
             return ts.strftime("%Y-%m-%d")
     except Exception:
@@ -348,232 +340,136 @@ def _date_str(d):
     return None
 
 
-def _campaigns_from_csv() -> list[dict] | None:
-    """Derive campaign dicts from samples.csv if it exists.
+CONTEXT_DAYS = 30
 
-    Returns a list of campaign dicts (same schema as load_campaigns_from_samples)
-    or None if samples.csv is not present.
-    """
-    import os as _os
-    if not _os.path.exists(SAMPLES_CSV):
-        return None
-    try:
-        df = pd.read_csv(SAMPLES_CSV, low_memory=False)
-    except Exception as e:
-        print(f"  [WARN] Cannot read samples.csv: {e}")
-        return None
 
-    required = {"campaign_code", "latitude", "longitude", "collection_date"}
-    if not required.issubset(df.columns):
-        print("  [WARN] samples.csv missing required columns — falling back to xlsx")
-        return None
+def campaign_date_window(campaign, padding_days=None):
+    """Return an inclusive day-level search window without changing sample dates."""
+    from datetime import date, timedelta
 
-    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
-    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    df = df.dropna(subset=["latitude", "longitude"])
+    padding = campaign.get("context_days", CONTEXT_DAYS) if padding_days is None else padding_days
+    if isinstance(padding, bool) or not isinstance(padding, int) or padding < 0:
+        raise ValueError("Context padding must be a non-negative integer number of days")
+    if not campaign.get("date_min") or not campaign.get("date_max"):
+        raise ValueError("Cannot build a query without both sampling dates")
+    start = date.fromisoformat(campaign["date_min"])
+    end = date.fromisoformat(campaign["date_max"])
+    if end < start:
+        raise ValueError("Sampling end precedes sampling start")
+    return (start - timedelta(days=padding)).isoformat(), (end + timedelta(days=padding)).isoformat()
 
+
+def temporal_scope(campaign, observation_time):
+    """Classify day-level temporal support separately from spatial matching."""
+    if observation_time is None or not campaign.get("date_min") or not campaign.get("date_max"):
+        return "unknown"
+    endpoints = str(observation_time).split("/")
+    if len(endpoints) > 2:
+        return "unknown"
+    start, end = _date_str(endpoints[0]), _date_str(endpoints[-1])
+    if not start or not end or end < start:
+        return "unknown"
+    if campaign["date_min"] <= start <= end <= campaign["date_max"]:
+        return "within_sample_window"
+    if start <= campaign["date_max"] and end >= campaign["date_min"]:
+        return "overlaps_sample_window"
+    return "context"
+
+
+def _campaigns_from_frame(df):
     campaigns: list[dict] = []
-    for code, grp in df.groupby("campaign_code", sort=False):
-        lat_vals = grp["latitude"].values
-        lon_vals = grp["longitude"].values
-        lat_min, lat_max = float(lat_vals.min()), float(lat_vals.max())
-        lon_min, lon_max = float(lon_vals.min()), float(lon_vals.max())
-
-        if lat_min == lat_max:
-            lat_min -= 0.05; lat_max += 0.05
-        if lon_min == lon_max:
-            lon_min -= 0.05; lon_max += 0.05
-
-        dates = grp["collection_date"].dropna()
-        dates = dates[dates.astype(str).str.match(r"\d{4}-\d{2}-\d{2}")]
-        date_min = str(dates.min()) if len(dates) else None
-        date_max = str(dates.max()) if len(dates) else None
-
-        camp_area = str(grp["campaign_area"].iloc[0]) if "campaign_area" in grp.columns else str(code)
-        source_file = str(grp["source_file"].iloc[0]) if "source_file" in grp.columns else ""
-        clat = (lat_min + lat_max) / 2
-        clon = (lon_min + lon_max) / 2
-
-        campaigns.append({
-            "name":          str(code),
-            "campaign_code": str(code),
-            "campaign_name": camp_area,
-            "area":          camp_area,
-            "case_study":    "",
-            "n_stations":    len(grp),
-            "source_file":   source_file,
-            "lat_min":  lat_min, "lat_max": lat_max,
-            "lon_min":  lon_min, "lon_max": lon_max,
-            "clat":     clat,    "clon":    clon,
-            "date_min": date_min,
-            "date_max": date_max,
+    code_counts = df.groupby("campaign_code")["campaign_id"].nunique()
+    for campaign_id, group in df.groupby("campaign_id", sort=False):
+        spatial = group[group["spatial_kind"].isin(("point", "extent"))]
+        bounds = {
+            "lat_min": spatial["latitude_min"].min(), "lat_max": spatial["latitude_max"].max(),
+            "lon_min": spatial["longitude_min"].min(), "lon_max": spatial["longitude_max"].max(),
+        }
+        bounds = {key: float(value) if pd.notna(value) else None for key, value in bounds.items()}
+        starts = group["collection_date"].dropna()
+        ends = group["collection_end"].dropna()
+        code = str(group["campaign_code"].iloc[0])
+        reasons = set()
+        for flags in group["quality_flags"].dropna():
+            reasons.update(flag for flag in str(flags).split("|")
+                           if "unconfirmed" in flag or flag.startswith(("invalid_", "ambiguous_")))
+        if spatial.empty:
+            reasons.add("no_valid_spatial_extent")
+        if starts.empty or ends.empty:
+            reasons.add("no_valid_date_window")
+        if code_counts[code] > 1:
+            reasons.add("duplicate_campaign_metadata")
+        if bounds["lon_min"] is not None and bounds["lon_max"] - bounds["lon_min"] > 180:
+            reasons.add("wide_or_antimeridian_extent")
+        blocking_reasons = reasons.intersection({
+            "no_valid_spatial_extent", "no_valid_date_window", "duration_semantics_unconfirmed",
         })
+        has_bounds = all(value is not None for value in bounds.values())
+        campaigns.append({
+            "name": code if code_counts[code] == 1 else f"{code} ({campaign_id[:8]})",
+            "campaign_id": str(campaign_id), "campaign_code": code,
+            "campaign_name": str(group["campaign_area"].iloc[0]),
+            "area": str(group["campaign_area"].iloc[0]), "case_study": "",
+            "n_stations": int(group["station_label"].replace("", pd.NA).nunique()),
+            "n_samples": len(group), "source_file": str(group["source_file"].iloc[0]),
+            **bounds,
+            "clat": (bounds["lat_min"] + bounds["lat_max"]) / 2 if has_bounds else None,
+            "clon": (bounds["lon_min"] + bounds["lon_max"]) / 2 if has_bounds else None,
+            "date_min": str(starts.min()) if len(starts) else None,
+            "date_max": str(ends.max()) if len(ends) else None,
+            "review_reasons": sorted(reasons),
+            "blocking_reasons": sorted(blocking_reasons),
+            "context_days": CONTEXT_DAYS,
+            "suspect_value_policy": "retain_literal",
+        })
+        campaign = campaigns[-1]
+        if campaign["date_min"] and campaign["date_max"]:
+            campaign["query_date_min"], campaign["query_date_max"] = campaign_date_window(campaign)
+        else:
+            campaign["query_date_min"] = campaign["query_date_max"] = None
     return campaigns
 
 
-def load_campaigns_from_samples():
-    """Read every .xlsx in SAMPLES_FOLDER and emit one campaign dict per file.
+def _campaigns_from_csv(folder=SAMPLES_FOLDER, csv_path=SAMPLES_CSV):
+    """Read only a verified normalized index matching the current workbooks."""
+    import hashlib
+    import json
+    from build_samples_csv import SCHEMA_VERSION, OUTPUT_COLS, input_fingerprints
 
-    If samples.csv exists in the workspace root (produced by build_samples_csv.py),
-    campaign extents are derived from that pre-normalised file instead of re-parsing
-    the xlsx files, which is both faster and guarantees the same coordinate
-    normalisation that the retrieval pipeline uses.
+    path = Path(csv_path)
+    try:
+        manifest = json.loads(path.with_suffix(".audit.json").read_text(encoding="utf-8"))
+        if (manifest.get("schema_version") != SCHEMA_VERSION
+                or manifest.get("inputs") != input_fingerprints(folder)
+                or manifest.get("csv_sha256") != hashlib.sha256(path.read_bytes()).hexdigest()):
+            return None
+        if any(report.get("status") == "error" for report in manifest.get("workbooks", [])):
+            raise ValueError("Unreadable workbook: inspect samples.audit.json before fetching")
+        numeric = {"source_row", "latitude", "longitude", "latitude_min", "latitude_max",
+               "longitude_min", "longitude_max", "depth_m"}
+        frame = pd.read_csv(path, low_memory=False, keep_default_na=False, na_values=[""],
+                    float_precision="round_trip",
+                    dtype={column: str for column in OUTPUT_COLS if column not in numeric})
+        if not set(OUTPUT_COLS).issubset(frame.columns):
+            return None
+    except (OSError, KeyError, pd.errors.ParserError, json.JSONDecodeError):
+        return None
+    return _campaigns_from_frame(frame)
 
-    Each Excel follows the v0.11 Sample Collection Template:
-      * Sheet 'Campaign'  → first non-empty row gives Campaign Code,
-        Campaign Name, Area of Study, Case study, Number of Stations.
-      * Sheet 'Sample'    → per-row Latitude / Longitude (decimal degrees
-        or deg-decmin / DMS strings with hemisphere) and
-        'Date of sampling start*' (+ optional 'Sampling duration - days').
 
-    The bbox is the min/max of valid coordinates from the Sample sheet;
-    the campaign window is min(start) … max(start + duration_days). If
-    Campaign Code is missing the file stem is used. Files starting
-    with 'SEEMS OLD' are skipped.
-    """
-    # Fast path: use pre-built samples.csv
-    csv_camps = _campaigns_from_csv()
-    if csv_camps is not None:
-        print(f"  [samples] Loaded {len(csv_camps)} campaigns from samples.csv")
-        return csv_camps
-
-    import glob, os, datetime as _dt
-
-    campaigns: list[dict] = []
-    seen_codes: dict = {}
-
-    for path in sorted(glob.glob(os.path.join(SAMPLES_FOLDER, "*.xlsx"))):
-        fname = os.path.basename(path)
-        if fname.startswith("SEEMS OLD"):
-            continue
-        stem = os.path.splitext(fname)[0]
-        try:
-            xl = pd.ExcelFile(path)
-        except Exception as e:
-            print(f"  [WARN] Cannot open {fname}: {e}")
-            continue
-
-        # --- Campaign sheet ---
-        camp_code = None
-        camp_name = None
-        camp_area = None
-        case_study = None
-        n_stations = None
-        if "Campaign" in xl.sheet_names:
-            try:
-                cdf = pd.read_excel(path, sheet_name="Campaign")
-                cdf = cdf.dropna(how="all")
-                if len(cdf):
-                    row = cdf.iloc[0]
-                    def _g(*keys):
-                        for k in keys:
-                            if k in cdf.columns:
-                                v = row.get(k)
-                                if v is not None and not (isinstance(v, float) and math.isnan(v)):
-                                    return v
-                        return None
-                    camp_code  = _g("Campaign Code")
-                    camp_name  = _g("Campaign Name")
-                    camp_area  = _g("Area of Study")
-                    case_study = _g("Case study*", "Case study")
-                    n_stations = _g("Number of Stations")
-            except Exception as e:
-                print(f"  [WARN] Cannot read 'Campaign' sheet in {fname}: {e}")
-
-        if camp_code is None or (isinstance(camp_code, float) and math.isnan(camp_code)):
-            camp_code = stem
-        camp_code = str(camp_code).strip()
-        if camp_code in seen_codes:
-            print(f"  [WARN] Duplicate Campaign Code '{camp_code}' in {fname}; "
-                  f"appending file stem to disambiguate")
-            camp_code = f"{camp_code} ({stem})"
-        seen_codes[camp_code] = path
-
-        if camp_name is None:
-            camp_name = camp_area or stem
-        if camp_area is None:
-            camp_area = camp_name
-
-        # --- Sample sheet (bbox + dates) ---
-        if "Sample" not in xl.sheet_names:
-            print(f"  [WARN] No 'Sample' sheet in {fname} - skipping")
-            continue
-        try:
-            sdf = pd.read_excel(path, sheet_name="Sample")
-        except Exception as e:
-            print(f"  [WARN] Cannot read 'Sample' sheet in {fname}: {e}")
-            continue
-
-        lat_col = next((c for c in sdf.columns if str(c).strip().lower() == "latitude"), None)
-        lon_col = next((c for c in sdf.columns if str(c).strip().lower() == "longitude"), None)
-        date_col = next((c for c in sdf.columns
-                         if str(c).strip().lower().startswith("date of sampling start")), None)
-        dur_col = next((c for c in sdf.columns
-                        if str(c).strip().lower().startswith("sampling duration - days")), None)
-
-        if lat_col is None or lon_col is None or date_col is None:
-            print(f"  [WARN] {fname}: missing Latitude/Longitude/Date column - skipping")
-            continue
-
-        lats = [_parse_coord(v) for v in sdf[lat_col]]
-        lons = [_parse_coord(v) for v in sdf[lon_col]]
-        valid = [(la, lo) for la, lo in zip(lats, lons)
-                 if la is not None and lo is not None
-                 and -90 <= la <= 90 and -180 <= lo <= 180]
-        if not valid:
-            print(f"  [WARN] {fname}: no valid coordinates in Sample sheet - skipping")
-            continue
-        lat_vals = [la for la, _ in valid]
-        lon_vals = [lo for _, lo in valid]
-        lat_min, lat_max = min(lat_vals), max(lat_vals)
-        lon_min, lon_max = min(lon_vals), max(lon_vals)
-        if lat_min == lat_max:
-            lat_min -= 0.05; lat_max += 0.05
-        if lon_min == lon_max:
-            lon_min -= 0.05; lon_max += 0.05
-
-        # Dates: combine sampling start + duration to widen window
-        starts: list[str] = []
-        ends: list[str] = []
-        dur_series = sdf[dur_col] if dur_col else None
-        for i, dval in enumerate(sdf[date_col]):
-            ds = _date_str(dval)
-            if not ds:
-                continue
-            starts.append(ds)
-            dur_days = 0
-            if dur_series is not None:
-                dv = dur_series.iloc[i] if i < len(dur_series) else None
-                try:
-                    if dv is not None and not (isinstance(dv, float) and math.isnan(dv)):
-                        dur_days = int(float(dv))
-                except (TypeError, ValueError):
-                    dur_days = 0
-            try:
-                end_dt = _dt.datetime.strptime(ds, "%Y-%m-%d") + _dt.timedelta(days=max(dur_days, 0))
-                ends.append(end_dt.strftime("%Y-%m-%d"))
-            except ValueError:
-                ends.append(ds)
-        date_min = min(starts) if starts else None
-        date_max = max(ends) if ends else None
-
-        clat = (lat_min + lat_max) / 2
-        clon = (lon_min + lon_max) / 2
-        campaigns.append({
-            "name":          camp_code,           # primary key (= Campaign Code)
-            "campaign_code": camp_code,
-            "campaign_name": str(camp_name) if camp_name is not None else camp_code,
-            "area":          str(camp_area) if camp_area is not None else camp_code,
-            "case_study":    str(case_study) if case_study is not None else "",
-            "n_stations":    n_stations,
-            "source_file":   fname,
-            "lat_min":  lat_min, "lat_max": lat_max,
-            "lon_min":  lon_min, "lon_max": lon_max,
-            "clat":     clat,    "clon":    clon,
-            "date_min": date_min,
-            "date_max": date_max,
-        })
-
+def load_campaigns_from_samples(folder=SAMPLES_FOLDER, csv_path=SAMPLES_CSV, *, allow_unresolved=False):
+    """Retain flagged inputs; block only campaigns without usable query bounds."""
+    campaigns = _campaigns_from_csv(folder, csv_path)
+    if campaigns is None:
+        from build_samples_csv import build_samples_csv
+        build_samples_csv(folder, csv_path)
+        campaigns = _campaigns_from_csv(folder, csv_path)
+    if campaigns is None or not campaigns:
+        raise ValueError("No normalized campaigns available; inspect the sample audit")
+    unresolved = [camp for camp in campaigns if camp["blocking_reasons"]]
+    if unresolved and not allow_unresolved:
+        details = "; ".join(f"{camp['source_file']}: {', '.join(camp['blocking_reasons'])}" for camp in unresolved)
+        raise ValueError(f"Sample extent review required before fetching. {details}")
     return campaigns
 
 

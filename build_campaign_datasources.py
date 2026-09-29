@@ -65,6 +65,8 @@ import requests
 # Reuse the campaign loader + helpers from the existing discovery script
 from query_external_data import (
     load_campaigns_from_samples,
+    campaign_date_window,
+    temporal_scope,
     safe_get,
     haversine_km,
     EMSO_NODES,
@@ -98,6 +100,7 @@ COMMON_COLS = [
     "campaign_lat_min", "campaign_lat_max",
     "campaign_lon_min", "campaign_lon_max",
     "campaign_date_min", "campaign_date_max",
+    "query_date_min", "query_date_max", "temporal_scope",
     "source", "data_type", "dataset_id", "feature_id",
     "time", "lat", "lon", "depth_m",
     "geom_wkt",
@@ -208,6 +211,7 @@ def _centroid_of_geojson(geom: dict | None) -> tuple[float | None, float | None]
 
 def _row(camp: dict, **kw) -> dict:
     """Build a row prefilled with the campaign block + supplied overrides."""
+    query_start, query_end = campaign_date_window(camp)
     base = {
         "campaign_code":     camp["name"],
         "campaign_area":     camp["area"],
@@ -217,6 +221,9 @@ def _row(camp: dict, **kw) -> dict:
         "campaign_lon_max":  camp["lon_max"],
         "campaign_date_min": camp["date_min"],
         "campaign_date_max": camp["date_max"],
+        "query_date_min": query_start,
+        "query_date_max": query_end,
+        "temporal_scope": temporal_scope(camp, kw.get("time")) if kw.get("data_type") != "manifest" else "unknown",
         "source":      "", "data_type": "", "dataset_id": "",
         "feature_id":  "", "time":      "", "lat":  None,
         "lon":  None,      "depth_m":   None, "geom_wkt": "",
@@ -260,13 +267,14 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
             print(f"  Argo | {camp['name'][:45]:45s} SKIP (no date range)")
             continue
         print(f"  Argo | {camp['name'][:45]:45s}", end="  ")
+        query_start, query_end = campaign_date_window(camp)
         try:
             fetcher = ArgoFetcher(src="erddap", parallel=False, progress=False)
             ds = fetcher.region([
                 camp["lon_min"], camp["lon_max"],
                 camp["lat_min"], camp["lat_max"],
                 0, 2050,
-                camp["date_min"], camp["date_max"],
+                f"{query_start}T00:00:00Z", f"{query_end}T23:59:59Z",
             ]).to_xarray()
             df = ds.to_dataframe().reset_index()
         except FileNotFoundError:
@@ -341,7 +349,7 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
                     f"?latitude%2Clongitude%2Ctime%2Cplatform_number"
                     f"&latitude%3E={camp['lat_min']}&latitude%3C={camp['lat_max']}"
                     f"&longitude%3E={camp['lon_min']}&longitude%3C={camp['lon_max']}"
-                    f"&time%3E={camp['date_min']}&time%3C={camp['date_max']}"
+                    f"&time%3E={query_start}T00:00:00Z&time%3C={query_end}T23:59:59Z"
                 ),
             ))
         print(f"{len(sub)} rows -> {len([r for r in rows if r['campaign_code']==camp['name']])} kept")
@@ -405,6 +413,7 @@ def _emso_pick_vars(all_vars: list[str]) -> dict[str, str]:
 def fetch_emso(campaigns: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for camp in campaigns:
+        query_start, query_end = campaign_date_window(camp)
         for node in EMSO_NODES:
             dist = haversine_km(camp["clat"], camp["clon"], node["lat"], node["lon"])
             if dist > EMSO_RADIUS_KM:
@@ -412,8 +421,8 @@ def fetch_emso(campaigns: list[dict]) -> list[dict]:
             time_filter = ""
             if camp["date_min"] and camp["date_max"]:
                 time_filter = (
-                    f"&time%3E={camp['date_min']}T00:00:00Z"
-                    f"&time%3C={camp['date_max']}T23:59:59Z"
+                    f"&time%3E={query_start}T00:00:00Z"
+                    f"&time%3C={query_end}T23:59:59Z"
                 )
             for ds_id in node["dataset_ids"]:
                 # Discover what variables this dataset actually exposes
@@ -720,6 +729,7 @@ def fetch_emodnet_chemistry(campaigns: list[dict]) -> list[dict]:
         lon_max = min(camp["lon_max"] + PAD, camp["clon"] + HALF_BBOX)
         camp_start = camp.get("date_min") or ""
         camp_end = camp.get("date_max") or ""
+        query_start, query_end = campaign_date_window(camp)
 
         for ds_id in ds_ids:
             available = _emodchem_vars(ds_id)
@@ -738,6 +748,8 @@ def fetch_emodnet_chemistry(campaigns: list[dict]) -> list[dict]:
                 f"&longitude%3E={lon_min}&longitude%3C={lon_max}"
                 f"&latitude%3E={lat_min}&latitude%3C={lat_max}"
             )
+            if "time" in available:
+                url += f"&time%3E={query_start}T00:00:00Z&time%3C={query_end}T23:59:59Z"
             print(f"  Chem | {camp['name'][:25]:25s} {ds_id[:38]:38s}", end="  ")
             # Stream the ERDDAP CSV with a hard byte cap so we don't pull
             # multi-GB responses for very wide bbox * basin queries (which
@@ -1038,32 +1050,56 @@ BATHY_VALUE_COLS = ["elevation_m"]
 # 6. EMODnet Biology / OBIS occurrences
 # ---------------------------------------------------------------------------
 
+def _obis_occurrences(camp: dict, bounds: tuple[float, float, float, float], depth: int = 0):
+    """Fetch a complete OBIS bbox, splitting spatially when one response is capped."""
+    lon_min, lat_min, lon_max, lat_max = bounds
+    wkt = (
+        "POLYGON(("
+        f"{lon_min} {lat_min}, {lon_max} {lat_min}, {lon_max} {lat_max}, "
+        f"{lon_min} {lat_max}, {lon_min} {lat_min}))"
+    )
+    query_start, query_end = campaign_date_window(camp)
+    params = {"geometry": wkt, "size": OBIS_SIZE, "startdate": query_start, "enddate": query_end}
+    response = requests.get("https://api.obis.org/v3/occurrence", params=params, timeout=90)
+    if response.status_code != 200:
+        raise requests.HTTPError(f"OBIS HTTP {response.status_code}", response=response)
+    payload = response.json()
+    results = payload.get("results", [])
+    total = int(payload.get("total", len(results)))
+    if total <= OBIS_SIZE:
+        return [(record, response.url) for record in results], total, False
+    if depth >= 12 or lon_min == lon_max or lat_min == lat_max:
+        return [(record, response.url) for record in results], total, True
+    if lon_max - lon_min >= lat_max - lat_min:
+        midpoint = (lon_min + lon_max) / 2
+        children = ((lon_min, lat_min, midpoint, lat_max), (midpoint, lat_min, lon_max, lat_max))
+    else:
+        midpoint = (lat_min + lat_max) / 2
+        children = ((lon_min, lat_min, lon_max, midpoint), (lon_min, midpoint, lon_max, lat_max))
+    combined = []
+    partial = False
+    for child in children:
+        child_rows, _, child_partial = _obis_occurrences(camp, child, depth + 1)
+        combined.extend(child_rows)
+        partial = partial or child_partial
+    return combined, total, partial
+
+
 def fetch_biology(campaigns: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for camp in campaigns:
-        # OBIS expects a WKT polygon
-        wkt = (
-            "POLYGON(("
-            f"{camp['lon_min']} {camp['lat_min']}, {camp['lon_max']} {camp['lat_min']}, "
-            f"{camp['lon_max']} {camp['lat_max']}, {camp['lon_min']} {camp['lat_max']}, "
-            f"{camp['lon_min']} {camp['lat_min']}))"
-        )
-        params = {"geometry": wkt, "size": OBIS_SIZE}
-        if camp["date_min"]: params["startdate"] = camp["date_min"]
-        if camp["date_max"]: params["enddate"]   = camp["date_max"]
-        url = "https://api.obis.org/v3/occurrence"
         print(f"  OBIS | {camp['name'][:45]:45s}", end="  ")
         try:
-            r = requests.get(url, params=params, timeout=90)
-            if r.status_code != 200:
-                print(f"HTTP {r.status_code}")
-                continue
-            payload = r.json()
-        except Exception as e:
+            fetched, total, partial = _obis_occurrences(
+                camp, (camp["lon_min"], camp["lat_min"], camp["lon_max"], camp["lat_max"]))
+        except (requests.RequestException, ValueError) as e:
             print(f"ERR ({str(e)[:40]})")
             continue
-        results = payload.get("results", [])
-        for o in results:
+        unique = {}
+        for o, source_url in fetched:
+            key = str(o.get("id", "")) or json.dumps(o, sort_keys=True, default=str)
+            unique.setdefault(key, (o, source_url))
+        for o, source_url in unique.values():
             la = o.get("decimalLatitude"); lo = o.get("decimalLongitude")
             if la is None or lo is None:
                 continue
@@ -1088,10 +1124,10 @@ def fetch_biology(campaigns: list[dict]) -> list[dict]:
                 basis_of_record=str(o.get("basisOfRecord", "")),
                 institution_code=str(o.get("institutionCode", "")),
                 extra_json="",
-                source_url=r.url,
+                source_url=source_url,
             ))
-        total = payload.get("total", len(results))
-        print(f"{len(results)} of {total} returned")
+        status = "PARTIAL" if partial else "complete"
+        print(f"{len(unique)} unique of {total} root matches ({status})")
         time.sleep(0.5)
     return rows
 
@@ -1179,6 +1215,7 @@ def fetch_copernicus(campaigns: list[dict]) -> list[dict]:
         return _re.sub(r"[^A-Za-z0-9_-]+", "_", s2).strip("_")[:30] or "camp"
 
     for camp in campaigns:
+        query_start, query_end = campaign_date_window(camp)
         for ds_id, varlist, depth in CMEMS_PRODUCTS:
             manifest_url = f"https://data.marine.copernicus.eu/product/description?dataset={ds_id}"
             if cm is None or not have_creds:
@@ -1186,16 +1223,16 @@ def fetch_copernicus(campaigns: list[dict]) -> list[dict]:
                     camp,
                     source="Copernicus Marine", data_type="manifest", dataset_id=ds_id,
                     feature_id=f"{ds_id}@{camp['name']}",
-                    time=f"{camp['date_min']}/{camp['date_max']}",
-                    lat=camp["clat"], lon=camp["clon"],
+                    time="",
+                    lat=None, lon=None,
                     depth_m=(depth[0] if isinstance(depth, tuple) else depth),
-                    geom_wkt=_wkt_point(camp["clon"], camp["clat"]),
+                    geom_wkt="",
                     variables=",".join(varlist),
                     note="copernicusmarine package or credentials missing - fetch manually",
                     extra_json=json.dumps({
                         "minimum_longitude": camp["lon_min"], "maximum_longitude": camp["lon_max"],
                         "minimum_latitude":  camp["lat_min"], "maximum_latitude":  camp["lat_max"],
-                        "start_datetime":    camp["date_min"], "end_datetime":     camp["date_max"],
+                        "start_datetime": f"{query_start}T00:00:00Z", "end_datetime": f"{query_end}T23:59:59Z",
                         "minimum_depth":     (depth[0] if isinstance(depth, tuple) else depth),
                         "maximum_depth":     (depth[1] if isinstance(depth, tuple) else depth),
                     }),
@@ -1219,7 +1256,7 @@ def fetch_copernicus(campaigns: list[dict]) -> list[dict]:
                     dataset_id=ds_id, variables=varlist,
                     minimum_longitude=lon_min, maximum_longitude=lon_max,
                     minimum_latitude=lat_min,  maximum_latitude=lat_max,
-                    start_datetime=camp["date_min"],   end_datetime=camp["date_max"],
+                    start_datetime=f"{query_start}T00:00:00Z", end_datetime=f"{query_end}T23:59:59Z",
                     output_directory=tmp,
                     output_filename=f"{_slug(ds_id)}__{_slug(camp['name'])}.nc",
                     overwrite=True,

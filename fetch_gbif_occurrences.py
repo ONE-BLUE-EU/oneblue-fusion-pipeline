@@ -25,7 +25,7 @@ import json
 import requests
 from pathlib import Path
 import pandas as pd
-from query_external_data import load_campaigns_from_samples
+from query_external_data import load_campaigns_from_samples, campaign_date_window, temporal_scope
 
 _ROOT = Path(__file__).parent
 OUT = _ROOT / "dkan_resources" / "biology_gbif.csv"
@@ -59,6 +59,7 @@ def _keep(rec: dict) -> bool:
 
 def fetch_one(camp: dict) -> list[dict]:
     rows: list[dict] = []
+    query_start, query_end = campaign_date_window(camp)
     offset = 0
     seen = 0
     while seen < MAX_PER_CAMP:
@@ -70,8 +71,7 @@ def fetch_one(camp: dict) -> list[dict]:
             "limit":            PAGE_SIZE,
             "offset":           offset,
         }
-        if camp.get("date_min") and camp.get("date_max"):
-            params["eventDate"] = f"{camp['date_min']},{camp['date_max']}"
+        params["eventDate"] = f"{query_start},{query_end}"
         r = requests.get(API, params=params, timeout=90)
         if r.status_code != 200:
             print(f"    HTTP {r.status_code}; stopping")
@@ -95,6 +95,9 @@ def fetch_one(camp: dict) -> list[dict]:
                 "campaign_lon_max":  camp["lon_max"],
                 "campaign_date_min": camp["date_min"],
                 "campaign_date_max": camp["date_max"],
+                "query_date_min": query_start,
+                "query_date_max": query_end,
+                "temporal_scope": temporal_scope(camp, o.get("eventDate")),
                 "source":             "GBIF",
                 "data_type":          "occurrence",
                 "dataset_id":         str(o.get("datasetKey", "")),
