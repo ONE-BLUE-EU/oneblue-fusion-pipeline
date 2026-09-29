@@ -12,6 +12,19 @@ from query_external_data import _date_str, _parse_coord, _parse_coord_extent, ca
 
 
 class PublicationTests(unittest.TestCase):
+    def test_measurement_ids_preserve_distinct_values_at_same_pressure(self):
+        from build_campaign_datasources import _identify_oceanography
+        rows = pd.DataFrame([
+            dict(campaign_code='campaign', source='Argo', dataset_id='floats', feature_id='same',
+                 temperature_c=value, pressure_dbar=10)
+            for value in [15, 16, 15]
+        ])
+        result = _identify_oceanography(rows)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result.feature_id.is_unique)
+        self.assertEqual(result.provider_feature_id.tolist(), ['same', 'same'])
+        self.assertTrue(_identify_oceanography(result).equals(result))
+
     def test_null_record_times_parse_as_nat(self):
         from build_fused_outputs import _parse_record_dates
 
@@ -47,6 +60,128 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["depth_status"], "unverified")
         self.assertIsNone(matches[0]["depth_gap_m"])
+
+
+class SuspectListTests(unittest.TestCase):
+    def test_identifiers_ambiguity_and_authoritative_groups(self):
+        from enrich_outputs import enrich_chemistry
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'suspects.xlsx'
+            pd.DataFrame([
+                {'NORMAN_ID': 'one', 'Name': 'Alpha', 'CAS1': '1-11-1', 'CAS2': '9-99-9', 'Chemical Group': 'Pharmaceutical'},
+                {'NORMAN_ID': 'two', 'Name': 'Beta', 'CAS1': '2-22-2', 'CAS2': '9-99-9', 'Chemical Group': 'Industrial chemical'},
+            ]).to_excel(path, sheet_name='ONE-BLUE suspect list', index=False)
+            rows = pd.DataFrame([
+                {'cas_number': '1-11-1', 'compound_name': '', 'chemical_group': 'other'},
+                {'cas_number': None, 'compound_name': ' ALPHA ', 'chemical_group': 'other'},
+                {'cas_number': '9-99-9', 'compound_name': None, 'chemical_group': 'other'},
+                {'cas_number': '1-11-1', 'compound_name': 'Beta', 'chemical_group': 'other'},
+                {'cas_number': None, 'compound_name': None, 'chemical_group': None},
+            ])
+            result = enrich_chemistry(rows, path)
+            self.assertEqual(result.suspect_match_status.tolist(), ['matched', 'matched', 'ambiguous', 'conflicting_identifiers', 'not_applicable'])
+            self.assertEqual(result.loc[0, 'chemical_group'], 'Pharmaceutical')
+            self.assertEqual(result.loc[0, 'provider_chemical_group'], 'other')
+            self.assertFalse(result.loc[2, 'in_suspect_list'])
+            self.assertTrue(enrich_chemistry(result, path).equals(result))
+            self.assertEqual(len(enrich_chemistry(rows.iloc[:0], path)), 0)
+
+
+class ChemicalObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.campaign = dict(name='test', campaign_id='test', area='test', date_min='2024-06-10',
+                             date_max='2024-06-13', lat_min=52, lat_max=54, lon_min=-7, lon_max=-6)
+        self.record = dict(Date='2024-07-05', Latitude=52.36, Longitude=-6.47, PARAM='AG',
+                           Value='0.5', QFLAG='Q', LMQNT='0.5', MUNIT='ug/l',
+                           tblParamID=123, DEPHU='0.5', VFLAG='S')
+
+    def test_dome_query_and_local_scope_use_exact_padded_window(self):
+        from fetch_chemical_observations import dome_query, in_scope
+        query = dome_query(self.campaign)
+        self.assertEqual(query['startDate'], '2024-05-11T00:00:00Z')
+        self.assertEqual(query['endDate'], '2024-07-13T23:59:59Z')
+        self.assertEqual(query['minLon'], -7)
+        self.assertTrue(in_scope(self.campaign, 52, -7, '2024-07-13'))
+        for latitude, longitude, date in [(52, -7, '2024-07-14'), (52, -7, '2024'),
+                                           (None, -7, '2024-07-05'), (52, 0, '2024-07-05')]:
+            self.assertFalse(in_scope(self.campaign, latitude, longitude, date))
+
+    def test_dome_censoring_quality_and_depth_reference(self):
+        from fetch_chemical_observations import normalize_dome
+        for flag, expected in [('Q', '<LOQ'), ('D', '<LOD'), ('<', '<'), ('>', '>'), ('X', 'unknown')]:
+            row = normalize_dome(dict(self.record, QFLAG=flag), self.campaign, 'water', {}, 'url')
+            self.assertEqual(row['concentration_qualifier'], expected)
+            self.assertIsNone(row['parameter_value'])
+            self.assertEqual(row['parameter_reported_value'], 0.5)
+            self.assertEqual(row['provider_quality_status'], 'suspect_by_originator')
+        row = normalize_dome(dict(self.record, QFLAG=None), self.campaign, 'sediment', {}, 'url')
+        self.assertEqual(row['parameter_value'], 0.5)
+        self.assertIsNone(row['depth_m'])
+
+    def test_dome_pagination_completes_and_rejects_repeated_pages(self):
+        from fetch_chemical_observations import dome_records
+        first = {'totalCount': 2, 'data': [self.record]}
+        second = {'totalCount': 2, 'data': [dict(self.record, tblParamID=124)]}
+        with patch('fetch_chemical_observations.request_json', side_effect=[first, second]) as request:
+            rows, _ = dome_records(self.campaign, 'water', Path('.'))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(request.call_args.args[3]['page'], 2)
+        with patch('fetch_chemical_observations.request_json', side_effect=[first, first]):
+            with self.assertRaisesRegex(RuntimeError, 'pagination'):
+                dome_records(self.campaign, 'water', Path('.'))
+
+    def test_dome_vocabulary_case_and_cas(self):
+        from fetch_chemical_observations import dome_parameter
+        data = {'key': 'MN', 'description': 'manganese', 'parentRelation': [
+            {'codeType': {'key': 'CAS Numbers'}, 'code': {'key': '7439-96-5'}}]}
+        with patch('fetch_chemical_observations.request_json', return_value=data):
+            identity = dome_parameter('Mn', Path('.'))
+        self.assertEqual(identity['cas_number'], '7439-96-5')
+        self.assertEqual(identity['compound_name'], 'manganese')
+
+    def test_empodat_coordinates_censoring_and_pagination(self):
+        from fetch_chemical_observations import fetch_empodat
+        record = {'id': '123', 'Latitude': '52.36', 'Longitude': '-6.47', 'Sampling date': '2024-07-05',
+                  'Substance': {'Name': 'Triclosan', 'CAS RN': '3380-34-5'}, 'Sample matrix': 'Surface water - River water',
+                  'Individual concentration': 'Less than LoQ', 'Concentration': {'Value': '0.1', 'Unit': 'ug/l'}}
+        responses = [
+            {'Total records': 2, 'Show page': 1, 'Data': [record]},
+            {'Total records': 2, 'Show page': 2, 'Data': [dict(record, id='124', Latitude=None)]},
+        ]
+        with patch('fetch_chemical_observations.request_json', side_effect=responses):
+            rows, reports = fetch_empodat([self.campaign], ['3380-34-5'], Path('.'))
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]['parameter_value'])
+        self.assertEqual(rows[0]['concentration_qualifier'], '<LOQ')
+        self.assertEqual(reports[0]['missing_coordinates'], 1)
+        self.assertEqual(reports[0]['status'], 'complete_substance_query')
+
+    def test_empodat_fault_is_not_empty_success(self):
+        from fetch_chemical_observations import request_json
+        with tempfile.TemporaryDirectory() as folder, patch('fetch_chemical_observations.requests.request') as request:
+            response = request.return_value.__enter__.return_value
+            response.iter_content.return_value = [b'{"Fault":{"Message":"Invalid record number"}}']
+            with self.assertRaisesRegex(RuntimeError, 'API fault'):
+                request_json('GET', 'url', Path(folder))
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_empodat_budget_is_explicit(self):
+        from fetch_chemical_observations import fetch_empodat
+        payload = {'Total records': 2, 'Show page': 1, 'Data': [{'id': '1'}]}
+        with patch('fetch_chemical_observations.request_json', return_value=payload):
+            _, reports = fetch_empodat([self.campaign], ['3380-34-5'], Path('.'), max_pages=1)
+        self.assertEqual(reports[0]['status'], 'partial_page_budget')
+
+    def test_provider_refresh_preserves_other_sources_and_classifications(self):
+        from fetch_chemical_observations import merge_chemistry
+        existing = pd.DataFrame([dict(campaign_code='test', source='ICES DOME', dataset_id='DOME_CW',
+                                      feature_id='one', compound_name='Triclosan', cas_number='3380-34-5',
+                                      chemical_group='ONE-BLUE category', provider_chemical_group='provider category')])
+        with patch('enrich_outputs.enrich_chemistry', side_effect=lambda frame: frame.assign(suspect_match_status='matched')):
+            result = merge_chemistry(existing, [], {'EMODnet-Chemistry'})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0].provider_chemical_group, 'provider category')
+        self.assertEqual(result.iloc[0].suspect_match_status, 'matched')
 
 
 class CoordinateTests(unittest.TestCase):
@@ -321,23 +456,108 @@ class ProviderDateTests(unittest.TestCase):
 
     def test_argo_uses_whole_padded_final_day(self):
         import build_campaign_datasources as main
-        fetcher = SimpleNamespace(region=Mock(side_effect=FileNotFoundError))
-        module = SimpleNamespace(DataFetcher=lambda **kwargs: fetcher)
-        with patch.dict('sys.modules', {'argopy': module}):
+        with patch.object(main, '_argo_frame', return_value=pd.DataFrame()) as fetch:
             main.fetch_argo([self.campaign])
-        self.assertEqual(fetcher.region.call_args.args[0][-2:],
-                         ['2026-07-04T00:00:00Z', '2026-09-02T23:59:59Z'])
+        self.assertEqual(fetch.call_args.args[1:],
+                         (pd.Timestamp('2026-07-04'), pd.Timestamp('2026-09-02T23:59:59')))
+
+    def test_argo_http_prefers_adjusted_values_and_rejects_bad_qc(self):
+        import build_campaign_datasources as main
+        data = pd.DataFrame({
+            'pres': [10, 10], 'pres_qc': [1, 1], 'pres_adjusted': [11, 11], 'pres_adjusted_qc': [1, 1],
+            'temp': [15, 15], 'temp_qc': [1, 1], 'temp_adjusted': [16, 16], 'temp_adjusted_qc': [1, 4],
+            'psal': [35, 35], 'psal_qc': [4, 4], 'psal_adjusted': [None, None], 'psal_adjusted_qc': [9, 9],
+            'doxy': [200, 200], 'doxy_qc': [4, 4], 'time_qc': [1, 1], 'position_qc': [1, 4],
+        })
+        lines = data.to_csv(index=False).splitlines()
+        payload = (lines[0] + '\n' + ','.join([''] * len(data.columns)) + '\n' + '\n'.join(lines[1:])).encode()
+        with patch.object(main.requests, 'get') as request:
+            response = request.return_value.__enter__.return_value
+            response.status_code = 200
+            response.iter_content.return_value = [payload]
+            result = main._argo_frame(self.campaign, pd.Timestamp('2026-07-04'), pd.Timestamp('2026-09-02T23:59:59'))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0].temp_selected, 16)
+        self.assertEqual(result.iloc[0].pres_selected, 11)
+        self.assertTrue(pd.isna(result.iloc[0].psal_selected))
+        self.assertIn('time%3C=2026-09-02T23:59:59Z', request.call_args.args[0])
 
     def test_emso_uses_padded_dates(self):
         import build_campaign_datasources as main
-        node = {'lat': 42, 'lon': -6, 'node': 'test', 'dataset_ids': ['dataset']}
-        with patch.object(main, 'EMSO_NODES', [node]), \
-             patch.object(main, '_emso_discover_vars', return_value=['time']), \
-             patch.object(main, 'safe_get', return_value=None) as request, patch.object(main.time, 'sleep'):
+        catalogue = pd.DataFrame([dict(
+            datasetID='new_deployment', title='test', minLongitude=-6,
+            maxLongitude=-6, minLatitude=42, maxLatitude=42,
+            minTime='2026-01-01', maxTime='2026-12-31',
+        )])
+        metadata = pd.DataFrame([
+            {'Row Type': 'variable', 'Variable Name': name}
+            for name in ['time', 'latitude', 'longitude', 'TEMP']
+        ])
+        with (
+            patch.object(main, '_emso_catalogue', return_value=catalogue),
+            patch.object(main, '_emso_metadata', return_value=metadata),
+            patch.object(main, '_emso_measurements', return_value={'TEMP': 'temperature_c'}),
+            patch.object(main.requests, 'get') as request,
+        ):
+            response = request.return_value.__enter__.return_value
+            response.status_code = 404
+            response.text = 'Your query produced no matching results'
             main.fetch_emso([self.campaign])
         url = request.call_args.args[0]
         self.assertIn('&time%3E=2026-07-04T00:00:00Z', url)
         self.assertIn('&time%3C=2026-09-02T23:59:59Z', url)
+
+    def test_emso_keeps_all_deployments_and_filters_qc_and_sample_distance(self):
+        import json
+        import build_campaign_datasources as main
+        catalogue = pd.DataFrame([
+            dict(datasetID=name, title=name, minLongitude=-6, maxLongitude=-6,
+                 minLatitude=42, maxLatitude=42, minTime='2026-01-01', maxTime='2026-12-31')
+            for name in ['deployment_a', 'deployment_b']
+        ])
+        metadata = pd.DataFrame([
+            {'Row Type': 'variable', 'Variable Name': name}
+            for name in ['time', 'latitude', 'longitude', 'depth', 'TEMP', 'TEMP_QC']
+        ])
+        samples = pd.DataFrame({'campaign_id': ['sample-id'], 'latitude': [42], 'longitude': [-6]})
+        payload = (
+            'time,latitude,longitude,depth,TEMP,TEMP_QC\nUTC,degrees_north,degrees_east,m,degC,1\n'
+            '2026-08-03T00:00:00Z,42,-6,10,15,1\n'
+            '2026-08-03T01:00:00Z,42,-6,10,16,4\n'
+            '2026-08-03T02:00:00Z,48,-6,10,17,1\n'
+        ).encode()
+        read_csv = pd.read_csv
+        def read_input(path, *args, **kwargs):
+            return samples.copy() if isinstance(path, Path) else read_csv(path, *args, **kwargs)
+        campaign = dict(self.campaign, campaign_id='sample-id', clat=48)
+        with (
+            patch.object(main, '_emso_catalogue', return_value=catalogue),
+            patch.object(main, '_emso_metadata', return_value=metadata),
+            patch.object(main, '_emso_measurements', return_value={'TEMP': 'temperature_c'}),
+            patch.object(Path, 'exists', return_value=True),
+            patch.object(main.pd, 'read_csv', side_effect=read_input),
+            patch.object(main.requests, 'get') as request,
+        ):
+            response = request.return_value.__enter__.return_value
+            response.status_code = 200
+            response.iter_content.return_value = [payload]
+            rows = main.fetch_emso([campaign])
+        self.assertEqual({row['dataset_id'] for row in rows}, {'deployment_a', 'deployment_b'})
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['temperature_c'] == 15 and row['distance_km'] == 0 for row in rows))
+        self.assertTrue(all(json.loads(row['extra_json'])['distance_reference'] == 'nearest_sample_point' for row in rows))
+
+    def test_chemistry_writer_always_enriches(self):
+        import build_campaign_datasources as main
+        def enrich(frame):
+            return frame.assign(suspect_match_status='matched', classification_source='ONE-BLUE suspect list')
+        with tempfile.TemporaryDirectory() as folder, patch('enrich_outputs.enrich_chemistry', side_effect=enrich) as enrichment:
+            output = Path(folder) / 'chemistry.csv'
+            main._write_csv([{'compound_name': 'test'}], str(output), ['compound_name'])
+            result = pd.read_csv(output)
+        enrichment.assert_called_once()
+        self.assertEqual(result.loc[0, 'suspect_match_status'], 'matched')
+        self.assertEqual(result.loc[0, 'classification_source'], 'ONE-BLUE suspect list')
 
     def test_common_row_preserves_actual_window(self):
         import build_campaign_datasources as main
@@ -345,6 +565,16 @@ class ProviderDateTests(unittest.TestCase):
         self.assertEqual(row['campaign_date_min'], '2026-08-03')
         self.assertEqual(row['query_date_min'], '2026-07-04')
         self.assertEqual(row['temporal_scope'], 'context')
+
+    def test_emso_rejects_incompatible_oxygen_units(self):
+        import build_campaign_datasources as main
+        metadata = pd.DataFrame([
+            ['attribute', 'DOXY', 'standard_name', 'volume_fraction_of_oxygen_in_sea_water'],
+            ['attribute', 'DOXY', 'units', 'ml/l'],
+            ['attribute', 'TMES_1', 'standard_name', 'sea_water_temperature'],
+            ['attribute', 'TMES_1', 'units', 'degC'],
+        ], columns=['Row Type', 'Variable Name', 'Attribute Name', 'Value'])
+        self.assertEqual(main._emso_measurements(metadata), {'TMES_1': 'temperature_c'})
 
     def test_chemistry_sends_padded_time_filter(self):
         import build_campaign_datasources as main

@@ -50,6 +50,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import hashlib
+from pathlib import Path
 import os
 import re
 import sys
@@ -69,7 +71,6 @@ from query_external_data import (
     temporal_scope,
     safe_get,
     haversine_km,
-    EMSO_NODES,
     EMSO_ERDDAP,
     EMODCHEM_ERDDAP,
     HA_WFS,
@@ -233,6 +234,21 @@ def _row(camp: dict, **kw) -> dict:
     return base
 
 
+def _identify_oceanography(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    if result.empty:
+        return result
+    original = result.get("provider_feature_id", pd.Series(index=result.index, dtype=object))
+    result["provider_feature_id"] = original.replace("", None).fillna(result["feature_id"])
+    numeric = ["lat", "lon", "depth_m", "temperature_c", "salinity_psu", "pressure_dbar", "oxygen_umol_kg", "ph"]
+    def identity(row):
+        values = {key: str(row.get(key)) for key in ("source", "dataset_id", "provider_feature_id", "time", "extra_json")}
+        values.update({key: float(row[key]) if pd.notna(row.get(key)) else None for key in numeric})
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:32]
+    result["feature_id"] = result.apply(identity, axis=1)
+    return result.drop_duplicates(["campaign_code", "source", "dataset_id", "feature_id"])
+
+
 def _write_csv(rows: list[dict], path: str, value_cols: list[str]):
     """Write rows ordered as: COMMON_COLS, value_cols, TRAILING_COLS.
 
@@ -245,21 +261,74 @@ def _write_csv(rows: list[dict], path: str, value_cols: list[str]):
         if c not in df.columns:
             df[c] = ""
     df = df[cols]
+    if os.path.basename(path) == "oceanography.csv":
+        df = _identify_oceanography(df)
+    if os.path.basename(path) == "chemistry.csv":
+        from enrich_outputs import enrich_chemistry
+        df = enrich_chemistry(df)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     df.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"  wrote {len(df):>6d} rows -> {os.path.relpath(path, os.path.dirname(__file__))}")
 
 
 # ---------------------------------------------------------------------------
-# 1. Argo profiles (argopy)
+# 1. Argo profiles (public Ifremer ERDDAP)
 # ---------------------------------------------------------------------------
 
+ARGO_ERDDAP = "https://erddap.ifremer.fr/erddap"
+
+
+def _argo_frame(camp: dict, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    columns = ["platform_number", "cycle_number", "direction", "data_mode", "time",
+               "latitude", "longitude", "position_qc", "time_qc", "doxy", "doxy_qc"]
+    for variable in ("pres", "temp", "psal"):
+        columns.extend([variable, variable + "_qc", variable + "_adjusted", variable + "_adjusted_qc"])
+    url = (
+        f"{ARGO_ERDDAP}/tabledap/ArgoFloats.csv?{','.join(columns)}"
+        f"&longitude%3E={camp['lon_min']}&longitude%3C={camp['lon_max']}"
+        f"&latitude%3E={camp['lat_min']}&latitude%3C={camp['lat_max']}"
+        f"&time%3E={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        f"&time%3C={end.strftime('%Y-%m-%dT%H:%M:%SZ')}&pres%3E=0&pres%3C=2050"
+    )
+    oversized = False
+    with requests.get(url, timeout=(30, 180), stream=True) as response:
+        if response.status_code == 404 and "no matching results" in response.text.lower():
+            return pd.DataFrame()
+        response.raise_for_status()
+        chunks = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 32 * 1024 * 1024:
+                oversized = True
+                break
+    if oversized:
+        if (end - start).total_seconds() < 2:
+            raise RuntimeError("Argo response exceeds byte budget at minimum time partition")
+        midpoint = start + pd.Timedelta(seconds=int((end - start).total_seconds() // 2))
+        return pd.concat([_argo_frame(camp, start, midpoint),
+                          _argo_frame(camp, midpoint + pd.Timedelta(seconds=1), end)], ignore_index=True)
+    frame = pd.read_csv(StringIO(b"".join(chunks).decode("utf-8")), skiprows=[1], low_memory=False)
+    frame["request_url"] = url
+    for variable in ("pres", "temp", "psal", "doxy"):
+        quality = frame[variable + "_qc"].astype(str).str.replace(r"\.0$", "", regex=True)
+        selected = pd.to_numeric(frame[variable], errors="coerce").where(quality.isin(["1", "2"]))
+        mode = pd.Series("raw", index=frame.index)
+        if variable + "_adjusted" in frame:
+            adjusted_qc = frame[variable + "_adjusted_qc"].astype(str).str.replace(r"\.0$", "", regex=True)
+            adjusted = pd.to_numeric(frame[variable + "_adjusted"], errors="coerce").where(adjusted_qc.isin(["1", "2"]))
+            mode.loc[adjusted.notna()] = "adjusted"
+            selected = adjusted.combine_first(selected)
+        frame[variable + "_selected"] = selected
+        frame[variable + "_selected_mode"] = mode.where(selected.notna(), "missing_or_rejected")
+    valid = frame["pres_selected"].notna() & frame[["temp_selected", "psal_selected", "doxy_selected"]].notna().any(axis=1)
+    for field in ("time_qc", "position_qc"):
+        valid &= frame[field].astype(str).str.replace(r"\.0$", "", regex=True).isin(["1", "2"])
+    return frame.loc[valid].copy()
+
+
 def fetch_argo(campaigns: list[dict]) -> list[dict]:
-    try:
-        from argopy import DataFetcher as ArgoFetcher
-    except ImportError:
-        print("  argopy not installed -> skipping Argo (pip install argopy)")
-        return []
 
     rows: list[dict] = []
     for camp in campaigns:
@@ -269,16 +338,9 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
         print(f"  Argo | {camp['name'][:45]:45s}", end="  ")
         query_start, query_end = campaign_date_window(camp)
         try:
-            fetcher = ArgoFetcher(src="erddap", parallel=False, progress=False)
-            ds = fetcher.region([
-                camp["lon_min"], camp["lon_max"],
-                camp["lat_min"], camp["lat_max"],
-                0, 2050,
-                f"{query_start}T00:00:00Z", f"{query_end}T23:59:59Z",
-            ]).to_xarray()
-            df = ds.to_dataframe().reset_index()
+            df = _argo_frame(camp, pd.Timestamp(query_start),
+                             pd.Timestamp(query_end) + pd.Timedelta(hours=23, minutes=59, seconds=59))
         except FileNotFoundError:
-            # ERDDAP returns 404 when no floats match -> argopy raises FNF
             print("0 rows (no floats in bbox/period)")
             continue
         except Exception as e:
@@ -294,10 +356,10 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
         col_t = cmap.get("TIME")
         col_la = cmap.get("LATITUDE")
         col_lo = cmap.get("LONGITUDE")
-        col_p  = cmap.get("PRES") or cmap.get("PRES_ADJUSTED")
-        col_T  = cmap.get("TEMP") or cmap.get("TEMP_ADJUSTED")
-        col_S  = cmap.get("PSAL") or cmap.get("PSAL_ADJUSTED")
-        col_O  = cmap.get("DOXY") or cmap.get("DOXY_ADJUSTED")
+        col_p  = cmap.get("PRES_SELECTED")
+        col_T  = cmap.get("TEMP_SELECTED")
+        col_S  = cmap.get("PSAL_SELECTED")
+        col_O  = cmap.get("DOXY_SELECTED")
         col_pl = cmap.get("PLATFORM_NUMBER")
         col_cy = cmap.get("CYCLE_NUMBER")
 
@@ -332,10 +394,10 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
             cyc  = r.get(col_cy) if col_cy else ""
             rows.append(_row(
                 camp,
-                source="Euro-Argo", data_type="profile", dataset_id="ArgoGDAC",
-                feature_id=f"{plat}_c{cyc}_{int(r['_std_depth'])}m",
+                source="Argo GDAC (Ifremer)", data_type="profile", dataset_id="ArgoFloats",
+                feature_id=f"{plat}_c{cyc}_{r.get('direction', '')}_{t_iso}_{r[col_p]}dbar",
                 time=t_iso, lat=float(la), lon=float(lo),
-                depth_m=float(r['_std_depth']),
+                depth_m=float(r[col_p]),
                 geom_wkt=_wkt_point(float(lo), float(la)),
                 pressure_dbar=float(r[col_p]) if not pd.isna(r[col_p]) else None,
                 temperature_c=float(r[col_T]) if col_T and not pd.isna(r[col_T]) else None,
@@ -343,158 +405,173 @@ def fetch_argo(campaigns: list[dict]) -> list[dict]:
                 oxygen_umol_kg=float(r[col_O]) if col_O and not pd.isna(r[col_O]) else None,
                 platform_number=str(plat) if not pd.isna(plat) else "",
                 cycle_number=int(cyc) if cyc != "" and not pd.isna(cyc) else "",
-                extra_json="",
-                source_url=(
-                    f"https://erddap.ifremer.fr/erddap/tabledap/ArgoFloats.html"
-                    f"?latitude%2Clongitude%2Ctime%2Cplatform_number"
-                    f"&latitude%3E={camp['lat_min']}&latitude%3C={camp['lat_max']}"
-                    f"&longitude%3E={camp['lon_min']}&longitude%3C={camp['lon_max']}"
-                    f"&time%3E={query_start}T00:00:00Z&time%3C={query_end}T23:59:59Z"
-                ),
+                extra_json=json.dumps({
+                    "depth_method": "pressure_dbar_approx_metres", "standard_depth_m": r['_std_depth'],
+                    **{key: str(r[key]) for key in df.columns if key.endswith(("_qc", "_selected_mode"))},
+                }),
+                source_url=r["request_url"],
             ))
         print(f"{len(sub)} rows -> {len([r for r in rows if r['campaign_code']==camp['name']])} kept")
     return rows
 
 ARGO_VALUE_COLS = [
     "pressure_dbar", "temperature_c", "salinity_psu", "oxygen_umol_kg",
-    "platform_number", "cycle_number",
+    "platform_number", "cycle_number", "provider_feature_id",
 ]
 
 
 # ---------------------------------------------------------------------------
-# 2. EMSO time series (hourly mean)
+# 2. EMSO time series (provider resolution)
 # ---------------------------------------------------------------------------
 
-# Cache discovered EMSO variable lists across the run
-_EMSO_VAR_CACHE: dict[str, list[str]] = {}
-
-# Conceptual category -> ordered list of variable-name prefixes to look for
-# in EMSO datasets (CF / OceanSITES style). First match wins per dataset.
-EMSO_VAR_MAP = {
-    "temperature_c":  ["TEMP"],
-    "salinity_psu":   ["PSAL"],
-    "oxygen_umol_kg": ["DOX1", "DOXY"],
-    "pressure_dbar":  ["PRES"],
-    "ph":             ["PHPH"],
-}
+def _emso_catalogue() -> pd.DataFrame:
+    url = (f"{EMSO_ERDDAP}/tabledap/allDatasets.csv?"
+           "datasetID,title,minLongitude,maxLongitude,minLatitude,maxLatitude,minTime,maxTime")
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return pd.read_csv(StringIO(response.text), skiprows=[1])
 
 
-def _emso_discover_vars(ds_id: str) -> list[str]:
-    """Return list of variable names defined in this EMSO ERDDAP dataset."""
-    if ds_id in _EMSO_VAR_CACHE:
-        return _EMSO_VAR_CACHE[ds_id]
-    url = f"{EMSO_ERDDAP}/info/{ds_id}/index.csv"
-    resp = safe_get(url, timeout=30)
-    if resp is None or resp.status_code != 200:
-        _EMSO_VAR_CACHE[ds_id] = []
-        return []
-    try:
-        df = pd.read_csv(StringIO(resp.text))
-        vs = df.loc[df["Row Type"] == "variable", "Variable Name"].astype(str).tolist()
-    except Exception:
-        vs = []
-    _EMSO_VAR_CACHE[ds_id] = vs
-    return vs
+def _emso_metadata(dataset_id: str) -> pd.DataFrame:
+    response = requests.get(f"{EMSO_ERDDAP}/info/{dataset_id}/index.csv", timeout=60)
+    response.raise_for_status()
+    return pd.read_csv(StringIO(response.text), low_memory=False)
 
 
-def _emso_pick_vars(all_vars: list[str]) -> dict[str, str]:
-    """Map our canonical column names -> actual EMSO variable name."""
-    picked: dict[str, str] = {}
-    for canon, prefixes in EMSO_VAR_MAP.items():
-        for v in all_vars:
-            if v.endswith("_QC"):
-                continue
-            if any(v == p or v.startswith(p + "_") or v.startswith(p) for p in prefixes):
-                picked[canon] = v
-                break
+def _emso_measurements(metadata: pd.DataFrame) -> dict:
+    standards = {
+        "sea_water_temperature": ("temperature_c", {"degc", "degree_celsius", "degrees_celsius"}),
+        "sea_water_practical_salinity": ("salinity_psu", {"psu", "1", "dmnless"}),
+        "sea_water_salinity": ("salinity_psu", {"psu", "1", "dmnless"}),
+        "sea_water_pressure": ("pressure_dbar", {"dbar", "decibar"}),
+        "moles_of_oxygen_per_unit_mass_in_sea_water": ("oxygen_umol_kg", {"micromole/kg", "umol/kg", "micromoles/kg"}),
+        "sea_water_ph_reported_on_total_scale": ("ph", {"1", "ph units"}),
+    }
+    attributes = metadata[metadata["Row Type"] == "attribute"]
+    picked = {}
+    for variable, group in attributes.groupby("Variable Name"):
+        attrs = dict(zip(group["Attribute Name"], group["Value"]))
+        standard = attrs.get("standard_name")
+        if standard in standards:
+            canonical, units = standards[standard]
+            if str(attrs.get("units", "")).lower() in units:
+                picked[variable] = canonical
     return picked
 
 
+def _emso_bounds(camp: dict) -> tuple:
+    latitude_pad = EMSO_RADIUS_KM / 110.0
+    south = max(-90, camp["lat_min"] - latitude_pad)
+    north = min(90, camp["lat_max"] + latitude_pad)
+    longitude_pad = min(180, latitude_pad / max(0.001, math.cos(math.radians(max(abs(south), abs(north))))))
+    west, east = camp["lon_min"] - longitude_pad, camp["lon_max"] + longitude_pad
+    if west < -180 or east > 180:
+        west, east = -180, 180
+    return south, north, west, east
+
+
+def _emso_candidates(catalogue: pd.DataFrame, camp: dict) -> pd.DataFrame:
+    start, end = campaign_date_window(camp)
+    south, north, west, east = _emso_bounds(camp)
+    valid = catalogue["datasetID"].ne("allDatasets")
+    for column, limit, lower in (("maxLatitude", south, True), ("minLatitude", north, False),
+                                  ("maxLongitude", west, True), ("minLongitude", east, False)):
+        values = pd.to_numeric(catalogue[column], errors="coerce")
+        valid &= values.isna() | (values.ge(limit) if lower else values.le(limit))
+    minimum = pd.to_datetime(catalogue["minTime"], errors="coerce", utc=True)
+    maximum = pd.to_datetime(catalogue["maxTime"], errors="coerce", utc=True)
+    valid &= minimum.isna() | minimum.le(pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1))
+    valid &= maximum.isna() | maximum.ge(pd.Timestamp(start, tz="UTC"))
+    return catalogue.loc[valid]
+
+
 def fetch_emso(campaigns: list[dict]) -> list[dict]:
-    rows: list[dict] = []
+    catalogue = _emso_catalogue()
+    sample_path = Path(__file__).parent / "samples.csv"
+    samples = pd.read_csv(sample_path, low_memory=False) if sample_path.exists() else pd.DataFrame()
+    metadata_cache = {}
+    rows = []
     for camp in campaigns:
-        query_start, query_end = campaign_date_window(camp)
-        for node in EMSO_NODES:
-            dist = haversine_km(camp["clat"], camp["clon"], node["lat"], node["lon"])
-            if dist > EMSO_RADIUS_KM:
-                continue
-            time_filter = ""
-            if camp["date_min"] and camp["date_max"]:
-                time_filter = (
-                    f"&time%3E={query_start}T00:00:00Z"
-                    f"&time%3C={query_end}T23:59:59Z"
-                )
-            for ds_id in node["dataset_ids"]:
-                # Discover what variables this dataset actually exposes
-                all_vars = _emso_discover_vars(ds_id)
-                picked = _emso_pick_vars(all_vars)
-                base_vars = [v for v in ("time", "latitude", "longitude", "depth") if v in all_vars]
-                if "time" not in all_vars:
-                    base_vars = ["time"] + base_vars  # safety: ERDDAP always has time
-                proj = base_vars + list(picked.values())
-                vars_csv = ",".join(proj) if proj else "time"
-                url = (
-                    f"{EMSO_ERDDAP}/tabledap/{ds_id}.csv?"
-                    + vars_csv + time_filter
-                )
-                print(f"  EMSO | {camp['name'][:25]:25s} -> {node['node']:18s} "
-                      f"{ds_id[:30]:30s} vars={len(picked)}", end="  ")
-                resp = safe_get(url, timeout=120)
-                if resp is None:
-                    print("ERR")
+        points = samples[samples["campaign_id"] == camp.get("campaign_id")] if not samples.empty else samples
+        locations = list(points[["latitude", "longitude"]].dropna().drop_duplicates().itertuples(index=False, name=None)) if not points.empty else []
+        using_samples = bool(locations)
+        if not locations:
+            locations = [(camp["clat"], camp["clon"])]
+        south, north, west, east = _emso_bounds(camp)
+        start, end = campaign_date_window(camp)
+        for dataset in _emso_candidates(catalogue, camp).to_dict("records"):
+            dataset_id = dataset["datasetID"]
+            try:
+                if dataset_id not in metadata_cache:
+                    metadata_cache[dataset_id] = _emso_metadata(dataset_id)
+                metadata = metadata_cache[dataset_id]
+                available = set(metadata.loc[metadata["Row Type"] == "variable", "Variable Name"])
+                picked = _emso_measurements(metadata)
+                if not picked or not {"time", "latitude", "longitude"}.issubset(available):
                     continue
-                if resp.status_code == 404:
-                    print("no-data")
-                    continue
-                try:
-                    df = pd.read_csv(StringIO(resp.text), skiprows=[1], low_memory=False)
-                except Exception as e:
-                    print(f"parse-err ({str(e)[:30]})")
-                    continue
-                if df.empty:
-                    print("0 rows")
-                    continue
-
-                # Downsample if huge (cap per dataset)
-                if len(df) > 5000:
-                    df = df.iloc[:: max(1, len(df) // 5000)]
-
-                # Rename source columns -> canonical
-                inv = {v: k for k, v in picked.items()}
-                df = df.rename(columns=inv)
-
-                for _, r in df.iterrows():
-                    la = r.get("latitude", node["lat"])
-                    lo = r.get("longitude", node["lon"])
-                    if pd.isna(la): la = node["lat"]
-                    if pd.isna(lo): lo = node["lon"]
-                    def _gf(c):
-                        if c not in r: return None
-                        v = r[c]
-                        return None if pd.isna(v) else float(v)
+                projection = ["time", "latitude", "longitude"]
+                projection += [key for key in ("depth", "sensor_id", "platform_id") if key in available]
+                projection += list(picked)
+                projection += [key + "_QC" for key in picked if key + "_QC" in available]
+                url = (f"{EMSO_ERDDAP}/tabledap/{dataset_id}.csv?{','.join(projection)}"
+                       f"&time%3E={start}T00:00:00Z&time%3C={end}T23:59:59Z"
+                       f"&latitude%3E={south}&latitude%3C={north}&longitude%3E={west}&longitude%3C={east}")
+                with requests.get(url, timeout=(30, 180), stream=True) as response:
+                    if response.status_code == 404 and "no matching results" in response.text.lower():
+                        print(f"  EMSO | {camp['name'][:25]} {dataset_id} no matching results")
+                        continue
+                    response.raise_for_status()
+                    chunks, size = [], 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        size += len(chunk)
+                        if size > 50 * 1024 * 1024:
+                            raise RuntimeError("response exceeds 50 MiB budget; dataset not imported")
+                        chunks.append(chunk)
+                frame = pd.read_csv(StringIO(b"".join(chunks).decode("utf-8")), skiprows=[1], low_memory=False)
+                before = len(rows)
+                distances = {}
+                for record in frame.to_dict("records"):
+                    latitude, longitude = record["latitude"], record["longitude"]
+                    if pd.isna(latitude) or pd.isna(longitude):
+                        continue
+                    location = (float(latitude), float(longitude))
+                    if location not in distances:
+                        distances[location] = min(haversine_km(*location, *sample) for sample in locations)
+                    distance = distances[location]
+                    if distance > EMSO_RADIUS_KM:
+                        continue
+                    values, quality = {}, {}
+                    for variable, canonical in picked.items():
+                        value = pd.to_numeric(record.get(variable), errors="coerce")
+                        flag = record.get(variable + "_QC")
+                        quality[variable] = str(flag) if flag is not None else "not_provided"
+                        if variable + "_QC" in available and str(flag).removesuffix(".0") not in {"1", "2"}:
+                            continue
+                        if pd.notna(value) and math.isfinite(float(value)) and canonical not in values:
+                            values[canonical] = float(value)
+                    if not values:
+                        continue
+                    depth = pd.to_numeric(record.get("depth"), errors="coerce")
                     rows.append(_row(
-                        camp,
-                        source="EMSO-ERIC", data_type="timeseries", dataset_id=ds_id,
-                        feature_id=f"{node['node']}_{r.get('time','')}",
-                        time=str(r.get("time", "")),
-                        lat=float(la), lon=float(lo),
-                        depth_m=_gf("depth"),
-                        geom_wkt=_wkt_point(float(lo), float(la)),
-                        temperature_c=_gf("temperature_c"),
-                        salinity_psu=_gf("salinity_psu"),
-                        node=node["node"], node_description=node["description"],
-                        distance_km=round(dist, 1),
-                        extra_json=json.dumps({
-                            k: _gf(k) for k in ("oxygen_umol_kg", "pressure_dbar", "ph") if k in df.columns
-                        }, default=str),
+                        camp, source="EMSO-ERIC", data_type="timeseries", dataset_id=dataset_id,
+                        feature_id=f"{dataset_id}:{record['time']}:{latitude}:{longitude}:{depth}:{record.get('sensor_id', '')}",
+                        time=record["time"], lat=latitude, lon=longitude,
+                        depth_m=float(depth) if pd.notna(depth) else None,
+                        geom_wkt=_wkt_point(longitude, latitude),
+                        node=str(record.get("platform_id", dataset_id)), node_description=dataset["title"],
+                        distance_km=round(distance, 3), **values,
+                        extra_json=json.dumps({"qc": quality, "variable_mapping": picked,
+                                               "distance_reference": "nearest_sample_point" if using_samples else "campaign_centroid_fallback"}),
                         source_url=url,
                     ))
-                print(f"{len(df)} rows")
-                break  # one dataset per node per campaign is enough
-            time.sleep(0.3)
+                print(f"  EMSO | {camp['name'][:25]} {dataset_id}: {len(rows) - before} usable rows")
+            except (requests.RequestException, ValueError, RuntimeError) as error:
+                print(f"  EMSO | {camp['name'][:25]} {dataset_id}: ERROR {error}")
     return rows
 
-EMSO_VALUE_COLS = ["temperature_c", "salinity_psu", "node", "node_description", "distance_km"]
+
+
+EMSO_VALUE_COLS = ["temperature_c", "salinity_psu", "oxygen_umol_kg", "pressure_dbar", "ph", "node", "node_description", "distance_km"]
 
 
 # ---------------------------------------------------------------------------
@@ -1347,8 +1424,9 @@ The `source` column inside each CSV identifies the upstream provider
 
 | File | Category | Sources merged |
 |------|----------|----------------|
-| `oceanography.csv`     | In-situ + gridded seawater observations | Euro-Argo, EMSO-ERIC, Copernicus Marine |
-| `chemistry.csv`        | Eutrophication & contaminants sampling stations (water / sediment / biota) with parameter flags and SeaDataNet CDI links | EMODnet Chemistry ERDDAP (per-basin tabledap) |
+| `oceanography.csv`     | Observations only | Argo GDAC (Ifremer), EMSO-ERIC, optional Copernicus Marine |
+| `oceanography_requests.csv` | Download requests, not observations | Copernicus Marine |
+| `chemistry.csv`        | Chemistry results and supporting parameters, with qualifiers, quality flags and suspect classification | EMODnet Chemistry; supplemental ICES DOME and selected NORMAN EMPODAT substances |
 | `human_activities.csv` | Anthropogenic features                   | EMODnet Human Activities (aquaculture / energy / protection / pressures / ports — see `data_type`) |
 | `bathymetry.csv`       | Seafloor depth                           | EMODnet Bathymetry via GEBCO 2020 (opentopodata.org) |
 | `biology.csv`          | Species occurrences                      | EMODnet Biology / OBIS API |
@@ -1366,7 +1444,7 @@ Or by source within a category:
 
 ```sql
 SELECT * FROM "<oceanography_resource_id>"
-WHERE campaign_code = 'Ionian Sea' AND source = 'Euro-Argo'
+WHERE campaign_code = 'Ionian Sea' AND source = 'Argo GDAC (Ifremer)'
 ```
 
 ## Regenerating
@@ -1376,13 +1454,26 @@ python build_campaign_datasources.py                          # all categories
 python build_campaign_datasources.py --only oceanography      # just one
 python build_campaign_datasources.py --only oceanography,biology --skip copernicus
 python build_campaign_datasources.py --out custom_dir
+python fetch_chemical_observations.py --providers dome
 ```
 
 Copernicus needs `pip install copernicusmarine` and credentials (env
 vars `COPERNICUSMARINE_SERVICE_USERNAME` / `_PASSWORD` or the file
 `~/.copernicusmarine/.copernicusmarine-credentials`); otherwise the
-Copernicus rows in `oceanography.csv` are emitted as a manifest with
-the bbox parameters needed to fetch each layer manually.
+request parameters are emitted in `oceanography_requests.csv`, never in
+observation Parquet or maps. With `--skip copernicus`, the request table is empty.
+
+Argo uses direct HTTP, accepted QC and selected pressure bands. EMSO uses
+live deployment metadata, compatible CF units and nearest-sample proximity.
+Budget failures remain partial retrievals, not evidence of missing measurements.
+Chemistry always uses the ONE-BLUE suspect workbook for unambiguous identity
+classification; the original provider group and unresolved identities remain
+visible. No historical chemistry fallback widens the padded campaign window.
+Supplemental retrieval writes `chemistry_coverage.json`; API errors and incomplete
+pagination leave existing chemistry unchanged. Censored results are not detections.
+EMODnet-only refreshes preserve supplemental providers. EMPODAT must be explicitly
+queried by CAS identifiers; see the main README for the bounded pilot command.
+See `../docs/output-and-leaflet.md` for QC, depth and coverage limitations.
 """
 
 
@@ -1435,14 +1526,21 @@ def main(argv: list[str] | None = None):
         if "copernicus" not in skips:
             print(" * Copernicus Marine")
             rows += fetch_copernicus(campaigns)
+        requests_only = [row for row in rows if row.get("data_type") == "manifest"]
+        rows = [row for row in rows if row.get("data_type") != "manifest"]
+        _write_csv(requests_only, os.path.join(out_dir, "oceanography_requests.csv"),
+                   value_cols=CMEMS_VALUE_COLS)
         _write_csv(rows, os.path.join(out_dir, "oceanography.csv"),
                    value_cols=OCEAN_VALUE_COLS)
 
     if "chemistry" in targets:
         print("\n--- Chemistry (EMODnet Chemistry catalogue) ---")
-        _write_csv(fetch_emodnet_chemistry(campaigns),
-                   os.path.join(out_dir, "chemistry.csv"),
-                   value_cols=CHEM_VALUE_COLS)
+        from fetch_chemical_observations import merge_chemistry
+        chemistry_path = os.path.join(out_dir, "chemistry.csv")
+        existing = pd.read_csv(chemistry_path, low_memory=False) if os.path.exists(chemistry_path) else pd.DataFrame()
+        chemistry = merge_chemistry(existing, fetch_emodnet_chemistry(campaigns), {"EMODnet-Chemistry"})
+        _write_csv(chemistry.to_dict("records"), chemistry_path,
+                   value_cols=list(dict.fromkeys(CHEM_VALUE_COLS + list(chemistry.columns))))
 
     if "human_activities" in targets:
         print("\n--- Human Activities (EMODnet HA) ---")

@@ -15,8 +15,9 @@ The `source` column inside each CSV identifies the upstream provider
 
 | File | Category | Sources merged |
 |------|----------|----------------|
-| `oceanography.csv`     | In-situ + gridded seawater observations | Euro-Argo, EMSO-ERIC, Copernicus Marine |
-| `chemistry.csv`        | Eutrophication & contaminants sampling stations (water / sediment / biota) with parameter flags and SeaDataNet CDI links | EMODnet Chemistry ERDDAP (per-basin tabledap) |
+| `oceanography.csv`     | Observations only | Argo GDAC (Ifremer), EMSO-ERIC, optional Copernicus Marine |
+| `oceanography_requests.csv` | Download requests, not observations | Copernicus Marine |
+| `chemistry.csv`        | Chemistry results and supporting parameters, with qualifiers, quality flags and suspect classification | EMODnet Chemistry; supplemental ICES DOME and selected NORMAN EMPODAT substances |
 | `human_activities.csv` | Anthropogenic features                   | EMODnet Human Activities (aquaculture / energy / protection / pressures / ports — see `data_type`) |
 | `bathymetry.csv`       | Seafloor depth                           | EMODnet Bathymetry via GEBCO 2020 (opentopodata.org) |
 | `biology.csv`          | Species occurrences                      | EMODnet Biology / OBIS API |
@@ -34,7 +35,7 @@ Or by source within a category:
 
 ```sql
 SELECT * FROM "<oceanography_resource_id>"
-WHERE campaign_code = 'Ionian Sea' AND source = 'Euro-Argo'
+WHERE campaign_code = 'Ionian Sea' AND source = 'Argo GDAC (Ifremer)'
 ```
 
 ## Regenerating
@@ -44,10 +45,23 @@ python build_campaign_datasources.py                          # all categories
 python build_campaign_datasources.py --only oceanography      # just one
 python build_campaign_datasources.py --only oceanography,biology --skip copernicus
 python build_campaign_datasources.py --out custom_dir
+python fetch_chemical_observations.py --providers dome
 ```
 
 Copernicus needs `pip install copernicusmarine` and credentials (env
 vars `COPERNICUSMARINE_SERVICE_USERNAME` / `_PASSWORD` or the file
 `~/.copernicusmarine/.copernicusmarine-credentials`); otherwise the
-Copernicus rows in `oceanography.csv` are emitted as a manifest with
-the bbox parameters needed to fetch each layer manually.
+request parameters are emitted in `oceanography_requests.csv`, never in
+observation Parquet or maps. With `--skip copernicus`, the request table is empty.
+
+Argo uses direct HTTP, accepted QC and selected pressure bands. EMSO uses
+live deployment metadata, compatible CF units and nearest-sample proximity.
+Budget failures remain partial retrievals, not evidence of missing measurements.
+Chemistry always uses the ONE-BLUE suspect workbook for unambiguous identity
+classification; the original provider group and unresolved identities remain
+visible. No historical chemistry fallback widens the padded campaign window.
+Supplemental retrieval writes `chemistry_coverage.json`; API errors and incomplete
+pagination leave existing chemistry unchanged. Censored results are not detections.
+EMODnet-only refreshes preserve supplemental providers. EMPODAT must be explicitly
+queried by CAS identifiers; see the main README for the bounded pilot command.
+See `../docs/output-and-leaflet.md` for QC, depth and coverage limitations.

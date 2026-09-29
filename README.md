@@ -16,6 +16,7 @@ fetch_climate.py              Step 3 — ERA5 climate per campaign day (Open-Met
 fetch_gbif_occurrences.py     Step 3 — GBIF species occurrences per campaign bbox
 fetch_msfd.py                 Step 3 — MSFD marine regions overlay
 fetch_raster_manifest.py      Step 3 — curated raster/WMS layer catalogue
+fetch_chemical_observations.py Step 3 — ICES DOME and selected NORMAN EMPODAT substances
 enrich_outputs.py             Step 4 — add perturbation_class and suspect-list matches
 build_fused_outputs.py        Step 5 — publish Parquet, candidate matches, catalog and static GeoJSON
 query_external_data.py        Shared utilities (campaign loader, coord parsers, ERDDAP helpers)
@@ -39,7 +40,7 @@ Place all filled-in Data Collection Template `.xlsx` files inside a `SAMPLES/` f
 
 All steps are run from the project root with a Python 3.10+ environment.
 
-**Implementation status (2026-09-29):** The pipeline has been run against all nine workbooks. Inclusive calendar-day durations, retained suspect values, padded temporal queries, OBIS spatial tiling, and Parquet/GeoJSON publication are implemented. The verified publication contains 7,334 sample rows and 6,436 candidate matches. Some upstream categories remain explicitly partial or unavailable; inspect `output/fused/catalog.json` before use. [The ingestion findings](docs/sample-review.md) document retained source issues, and [the output guide](docs/output-and-leaflet.md) defines the visualization contract.
+**Implementation status:** The pipeline has been run against all nine workbooks. Publication contains 7,334 sample rows, 498,635 oceanographic observations (27,664 Argo and 470,971 EMSO), and 6,646 candidate matches. Supplemental chemistry retrieval found 147 ICES DOME records at five Irish Sea stations, including 18 supporting measurements and 122 censored results; 75 rows match the ONE-BLUE suspect list. An EMPODAT pilot checked 289,591 records for four substances and retained no geotemporal matches; many records lacked usable coordinates/dates. This is not exhaustive chemistry coverage, and older observations are not substituted. Oceanography remains partial: one Iberian OBSEA deployment exceeded the 50 MiB response budget, and no Copernicus observations were downloaded. Inspect `output/fused/catalog.json` and its chemistry coverage report before use. [The ingestion findings](docs/sample-review.md) document retained source issues, and [the output guide](docs/output-and-leaflet.md) defines retrieval, QC, classification and visualization limits.
 
 **Step 1 — build the campaign index**
 
@@ -83,7 +84,7 @@ python -m unittest discover -s tests -p test_pipeline.py
 python build_campaign_datasources.py
 ```
 
-Fetches oceanography (Euro-Argo, EMSO-ERIC, Copernicus Marine), chemistry (EMODnet Chemistry), human activities (EMODnet Human Activities), bathymetry (GEBCO via opentopodata) and biology (OBIS) for every campaign. Outputs into `output/`.
+Fetches oceanography (Argo GDAC via Ifremer ERDDAP, EMSO-ERIC, optional Copernicus Marine), chemistry (EMODnet Chemistry), human activities (EMODnet Human Activities), bathymetry (GEBCO via opentopodata) and biology (OBIS) for every campaign. Outputs into `dkan_resources/`.
 
 Run a single category only:
 
@@ -100,7 +101,11 @@ python fetch_climate.py           # ERA5 daily climate per campaign
 python fetch_gbif_occurrences.py  # GBIF species occurrences
 python fetch_msfd.py              # MSFD marine region polygons
 python fetch_raster_manifest.py   # Curated WMS/WCS raster layer catalogue
+python fetch_chemical_observations.py --providers dome
+python fetch_chemical_observations.py --providers empodat --empodat-cas 3380-34-5 15307-86-5 335-67-1 1763-23-1 --max-pages 5
 ```
+
+The chemistry supplement preserves other providers and applies the ONE-BLUE suspect classification. DOME queries water, sediment and biota using full campaign bounds and the existing padded dates. EMPODAT queries only the explicitly supplied CAS identifiers (the example covers triclosan, diclofenac, PFOA and PFOS), with local date/coordinate filtering. API faults and exhausted page budgets are not treated as empty success and leave the existing chemistry CSV unchanged. Responses are cached under `dkan_resources/chemistry_cache/`; remove that cache to request fresh data. `dkan_resources/chemistry_coverage.json` records query scope, completion and exclusions. EMODnet-only refreshes preserve these supplemental sources.
 
 **Step 4 — enrich and classify**
 
@@ -108,7 +113,7 @@ python fetch_raster_manifest.py   # Curated WMS/WCS raster layer catalogue
 python enrich_outputs.py
 ```
 
-Adds `perturbation_class` to `chemistry.csv` and `human_activities.csv`, and cross-references chemistry records against the ONE-BLUE suspect list. Must be run after Step 2.
+Adds `perturbation_class` to chemistry and human activities. Chemistry is also matched automatically whenever the main fetcher writes it and whenever the publisher reads it, regardless of provider. Exact CAS aliases and conservative normalized exact names are checked against the ONE-BLUE suspect workbook. Unique matches use its chemical groups; ambiguous or conflicting identifiers remain unresolved, with provider classification preserved separately. Run this step after Step 2 to enrich human activities as well.
 
 **Step 5 — publish analytical and map outputs**
 
@@ -132,12 +137,12 @@ Most services are open APIs requiring no authentication.
 | EMODnet Human Activities WFS | No | — |
 | EMODnet Biology / OBIS | No | — |
 | EMSO-ERIC ERDDAP | No | — |
-| Euro-Argo (argopy) | No | — |
+| Argo GDAC (Ifremer ERDDAP) | No | Direct HTTP; no argopy dependency |
 | GBIF occurrence search | No | — |
 | EEA MSFD ArcGIS REST | No | — |
 | opentopodata (GEBCO bathymetry) | No | Public API, rate-limited to ~1 req/s |
 
-If Copernicus Marine credentials are absent, `build_campaign_datasources.py` skips the CMEMS download and instead writes a manifest row with the bounding-box parameters so the layer can be fetched manually.
+If Copernicus Marine credentials are absent, the main fetcher writes request parameters to `dkan_resources/oceanography_requests.csv`, separate from observations and excluded from observation Parquet, maps and sample matches. With `--skip copernicus`, this request table is empty.
 
 ---
 
@@ -170,8 +175,9 @@ Source-specific measurement columns follow, then `extra_json` and `source_url`.
 
 | File | Sources merged |
 |---|---|
-| `dkan_resources/oceanography.csv` | Euro-Argo, EMSO-ERIC, Copernicus Marine |
-| `dkan_resources/chemistry.csv` | EMODnet Chemistry ERDDAP (EUT and contaminant station series) |
+| `dkan_resources/oceanography.csv` | Argo GDAC, EMSO-ERIC, optional Copernicus observations |
+| `dkan_resources/oceanography_requests.csv` | Copernicus requests only; not observations |
+| `dkan_resources/chemistry.csv` | EMODnet Chemistry, ICES DOME, explicitly queried NORMAN EMPODAT substances |
 | `dkan_resources/human_activities.csv` | EMODnet Human Activities (aquaculture, energy, ports, pressures, protection) |
 | `dkan_resources/bathymetry.csv` | GEBCO 2020 via opentopodata |
 | `dkan_resources/biology.csv` | OBIS occurrence API |
@@ -188,4 +194,4 @@ Source-specific measurement columns follow, then `extra_json` and `source_url`.
 python -m pip install -r requirements.txt
 ```
 
-`argopy` and `copernicusmarine` are optional provider clients and are not included in the core pinned environment. Install them separately in a compatible Python environment when those providers are required. The verified Windows Python 3.14 run could not install/use `argopy`, and Copernicus data downloads also require credentials.
+Argo and EMSO use the core HTTP dependencies. Only `copernicusmarine` remains an optional provider client; install it separately in a compatible Python environment and configure credentials to download Copernicus products.

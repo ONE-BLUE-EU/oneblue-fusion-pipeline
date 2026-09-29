@@ -41,8 +41,8 @@ CATEGORY_FILES = {
 }
 
 COMPLETENESS = {
-    "oceanography": ("partial", "Copernicus request manifests only; Argo unavailable and no EMSO observations returned."),
-    "chemistry": ("unknown_empty", "No rows returned; upstream temporal/spatial coverage was not fully proven."),
+    "oceanography": ("partial", "Argo QC-filtered standard-pressure bands and metadata-discovered EMSO observations. EMSO responses above 50 MiB are skipped; Copernicus downloads are optional. Row counts do not imply complete coverage."),
+    "chemistry": ("partial", "EMODnet plus optional ICES DOME and explicitly selected EMPODAT substances. No historical fallback. Qualifiers, matrix and provider quality flags must be checked; censored values are not detections. See chemistry_coverage.json when present."),
     "human_activities": ("partial", "Legacy WFS requests used a 2,000-feature layer cap and some layers failed."),
     "bathymetry": ("sampled", "GEBCO values are a 5x5 campaign grid, not a complete raster."),
     "biology_obis": ("complete_api_count", "Spatial tiling retrieved the API-advertised campaign totals."),
@@ -58,6 +58,11 @@ MAP_PROPERTIES = [
     "compound_name", "parameter_name", "parameter_value", "parameter_unit",
     "layer_label", "name", "region_name", "subregion_name", "elevation_m",
     "temperature_c", "salinity_psu", "oxygen_umol_kg",
+    "ph", "chemical_group", "suspect_chem_group", "suspect_chem_subgroup",
+    "suspect_norman_id", "suspect_match_status", "classification_source",
+    "matrix", "matrix_detail", "measurement_role", "measurement_basis",
+    "concentration_qualifier", "parameter_reported_value", "detection_limit", "quantification_limit",
+    "provider_quality_flag", "provider_quality_status",
 ]
 
 
@@ -264,11 +269,20 @@ def publish(source: Path, output: Path) -> dict:
     _write_geoparquet(samples, output / "parquet" / "samples.parquet", samples.pop("geometry_wkb"))
 
     catalog = {"schema_version": SCHEMA_VERSION, "crs": "OGC:CRS84", "campaigns": [], "layers": {}}
+    coverage_path = source / "chemistry_coverage.json"
+    if coverage_path.exists():
+        shutil.copyfile(coverage_path, output / "chemistry_coverage.json")
+        catalog["chemistry_coverage"] = "chemistry_coverage.json"
     all_matches = []
     loaded = {}
     for category, filename in CATEGORY_FILES.items():
         path = source / filename
         frame = pd.read_csv(path, low_memory=False) if path.exists() else pd.DataFrame()
+        if category == "chemistry":
+            from enrich_outputs import enrich_chemistry
+            frame = enrich_chemistry(frame)
+        if category == "oceanography" and "data_type" in frame:
+            frame = frame[frame["data_type"].ne("manifest")].copy()
         if not frame.empty:
             frame["campaign_id"] = frame["campaign_code"].map(
                 {name: campaign["campaign_id"] for name, campaign in campaign_by_name.items()})
